@@ -1151,6 +1151,36 @@ case "$COMMAND" in
 
       run_find_files_for_target() {
         local target="$1"
+        
+        # Fast-path using fd/fdfind if available
+        if command -v fd &>/dev/null || command -v fdfind &>/dev/null; then
+          local fd_bin="fd"
+          command -v fdfind &>/dev/null && fd_bin="fdfind"
+          local -a fd_cmd=("$fd_bin" -t f -H) # -H to include hidden files
+          [[ "$FOLLOW_SYMLINKS" = true ]] && fd_cmd+=(-L)
+          [[ -n "$MAX_DEPTH" ]] && fd_cmd+=(-d "$MAX_DEPTH")
+          
+          # Add custom excludes
+          for ignore in "${DIR_IGNORES[@]}"; do
+             fd_cmd+=(-E "$ignore")
+          done
+          
+          if [[ ${#SIZE_EXPR[@]} -gt 0 ]]; then
+             # fallback to find if size filters are present to guarantee exact match
+             :
+          else
+            if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
+               fd_cmd+=("$FILE_NAME_PATTERN")
+            else
+               fd_cmd+=(".")
+            fi
+            
+            fd_cmd+=("$target" -0)
+            "${fd_cmd[@]}" 2>/dev/null
+            return
+          fi
+        fi
+
         local -a find_cmd=(find)
         [[ "$FOLLOW_SYMLINKS" = true ]] && find_cmd+=(-L)
         find_cmd+=("$target")
