@@ -1,0 +1,1260 @@
+#!/usr/bin/env bash
+# golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
+# Version: 5.0.0
+# Changes from v4.0.0:
+#   IMPLEMENTED (were stubs / broken):
+#   - --json / --yaml now fully serialize output (were hollow flags)
+#   - stats --desktop now writes to a file (was always printing to stdout)
+#   - to_windows_path() wired via print_saved_path() on every "saved to" message
+#   - get_changed_files() uses git status -z (filenames with spaces now handled)
+#   - detect_desktop() uses while+read loop (WSL usernames with spaces now handled)
+#   - validate_size_arg() guards --max-size before it reaches find
+#   NEW FEATURES:
+#   - load_golurkrc(): .golurkrc project-level config file (safe eval, CLI overrides)
+#   - --gitignore-full: negation (!) + double-star (**) .gitignore support
+#   - Colorized output (auto-detected; --no-color to disable)
+#   - --follow-symlinks: passes -L to find, -l to tree
+#   - --dry-run: preview content dump file list without writing
+#   - --watch [--watch-interval N]: live-reload loop via re-exec
+#   - --template STRING: inject LLM header into content dumps ({DATE},{ROOT},{LANG},{VERSION})
+#   - --line-count: total source line count in stats
+#   - golurk diff [commit]: new command (--staged, --stat, --no-color)
+#   - stats -o FILE: save stats to an explicit file
+#   - escape_json_string(): safe path encoding for JSON/YAML output
+set -euo pipefail
+IFS=$'\n\t'
+
+# Capture original args BEFORE any parsing (used by --watch re-exec)
+ORIGINAL_ARGS=("$@")
+
+# ──────────────────────────────────────────────────────────────────────
+# Basic env & defaults
+# ──────────────────────────────────────────────────────────────────────
+PROJECT_ROOT="$(pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")" 2>/dev/null || SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+VERSION="5.0.0"
+
+# ── Output / selection ────────────────────────────────────────────────
+OUTPUT_FILE=""
+EXTRA_EXCLUDES=()
+SHOW_FILES=true
+SELECT_PATHS=()
+DUMP_CONTENTS=false
+CONTENTS_FILE=""
+SKIP_BINARIES=false
+MAX_SIZE=""
+DIR_PATTERN=""
+MAX_DEPTH=""
+EXACT_LEVEL=""
+SHOW_LEVEL=""
+OUTPUT_TO_DESKTOP=false
+CONTENTS_TO_DESKTOP=false
+MICROSERVICE_PATTERN=""
+SHOW_MICROSERVICES_ONLY=false
+SHOW_LEVELS=false
+USE_JSON=false
+USE_YAML=false
+SHOW_STATS=false
+FILTER_EXTENSIONS=""
+EXCLUDE_EXTENSIONS=""
+ONLY_CHANGED=false
+SHORTEN_PATHS=false
+SHORTEN_LEVEL=0
+FLATTEN_SEPARATOR="."
+FILE_NAME_PATTERN=""
+SELECT_FILES_ONLY=false
+
+# ── v5.0.0 additions ─────────────────────────────────────────────────
+FOLLOW_SYMLINKS=false
+DRY_RUN=false
+SHOW_LINE_COUNT=false
+WATCH_MODE=false
+WATCH_INTERVAL=3
+CONTENT_TEMPLATE=""
+GITIGNORE_FULL=false
+NO_COLOR=false
+STATS_OUTPUT_FILE=""
+
+# ── Default ignores ───────────────────────────────────────────────────
+DIR_IGNORES=( "node_modules" ".next" ".git" "__pycache__" ".idea" ".vscode" "target" "build" "dist" "out" ".gradle" )
+FILE_IGNORES=()
+GITIGNORE_NEGATIONS=()   # patterns that un-exclude (e.g., !important.log)
+
+# ── Shared computed state (built once, reused) ────────────────────────
+PRUNE_ARGS=()
+GREP_REGEX=""
+TREE_PATTERN=""
+
+# ──────────────────────────────────────────────────────────────────────
+# Color setup — auto-detected; re-called after --no-color
+# ──────────────────────────────────────────────────────────────────────
+setup_colors() {
+  if [[ "$NO_COLOR" = true ]] || [[ ! -t 1 ]]; then
+    C_DIR="" C_FILE="" C_RESET="" C_DIM="" C_BOLD="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN=""
+  else
+    C_DIR="\033[1;34m"    # bold blue  — directories
+    C_FILE="\033[0m"      # default    — files
+    C_RESET="\033[0m"
+    C_DIM="\033[2m"
+    C_BOLD="\033[1m"
+    C_GREEN="\033[0;32m"
+    C_YELLOW="\033[0;33m"
+    C_RED="\033[0;31m"
+    C_CYAN="\033[0;36m"
+  fi
+}
+setup_colors
+
+# ──────────────────────────────────────────────────────────────────────
+# .golurkrc — project-level config loader
+# Loaded at startup; CLI args applied afterwards and always win.
+# Only safe VAR=value / VAR+=value assignments are allowed.
+# ──────────────────────────────────────────────────────────────────────
+load_golurkrc() {
+  local rc_file="$PROJECT_ROOT/.golurkrc"
+  [[ -f "$rc_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    local stripped="${line%%#*}"
+    stripped="$(printf '%s' "$stripped" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$stripped" ]] && continue
+    # Allow only simple assignments; block command substitutions
+    if [[ "$stripped" =~ ^[A-Z_][A-Z0-9_]*(=|\+=) ]] \
+       && [[ "$stripped" != *'$('* ]] \
+       && [[ "$stripped" != *'`'* ]]; then
+      eval "$stripped" 2>/dev/null \
+        || printf "Warning: .golurkrc line failed to apply: %s\n" "$stripped" >&2
+    else
+      printf "Warning: .golurkrc line ignored (unsafe/unrecognized): %s\n" "$stripped" >&2
+    fi
+  done < "$rc_file"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Desktop detection  [FIX v5: WSL usernames with spaces]
+# ──────────────────────────────────────────────────────────────────────
+detect_desktop() {
+  if [[ -n "${XDG_DESKTOP_DIR:-}" ]]; then echo "$XDG_DESKTOP_DIR"; return; fi
+  if [[ -d "$HOME/Desktop" ]]; then echo "$HOME/Desktop" && return; fi
+  if [[ -d "$HOME/desktop" ]]; then echo "$HOME/desktop" && return; fi
+  # WSL: use while+read to correctly handle usernames that contain spaces
+  if grep -qEi "(Microsoft|WSL)" /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    while IFS= read -r u; do
+      [[ -z "$u" ]] && continue
+      if [[ -d "/mnt/c/Users/$u/Desktop" ]]; then
+        echo "/mnt/c/Users/$u/Desktop"; return
+      fi
+    done < <(ls -1 /mnt/c/Users 2>/dev/null || true)
+  fi
+  echo "$HOME"
+}
+DESKTOP_PATH="$(detect_desktop)"
+
+to_windows_path() {
+  if command -v wslpath &>/dev/null; then
+    wslpath -w "$1" 2>/dev/null || echo "$1"
+  else
+    echo "$1"
+  fi
+}
+
+# Show a saved path; in WSL also appends the Windows equivalent.
+print_saved_path() {
+  local path="$1"
+  local wpath; wpath="$(to_windows_path "$path")"
+  if [[ "$wpath" != "$path" ]]; then
+    printf "%s  (Windows: %s)" "$path" "$wpath"
+  else
+    printf "%s" "$path"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Banner & usage
+# ──────────────────────────────────────────────────────────────────────
+banner() {
+  local TITLE="GOLURK"
+  local SUB="Project Structure Analyzer v${VERSION}"
+  if command -v figlet &>/dev/null && command -v lolcat &>/dev/null; then
+    figlet -f "ANSI Shadow" "$TITLE" | lolcat --spread=10 --freq=0.13 || true
+    echo "   $SUB" | lolcat || true
+  else
+    echo "=== $TITLE - $SUB ==="
+  fi
+  cat <<'EOF'
+Usage:
+  golurk                     Show this banner
+  golurk tree [options]      Generate project tree (full feature set)
+  golurk micro [options]     List microservices or select them
+  golurk stats [options]     Show project statistics
+  golurk diff [commit]       Show files changed vs commit/branch
+
+Common examples:
+  golurk tree --level 3 --shorten-paths
+  golurk tree -m "auth,payment" -d "controller" --desktop -o mytree.txt
+  golurk tree -f "pom.xml" -C contents.txt
+  golurk tree --json -o structure.json
+  golurk tree -C context.txt --template "Analyze this {LANG} project:"
+  golurk tree --watch --watch-interval 5
+  golurk micro
+  golurk stats --desktop --line-count
+  golurk diff main
+
+Run `golurk tree --help` for all tree options.
+EOF
+}
+
+usage_tree() {
+  cat <<'EOF'
+golurk tree [options]
+
+Options:
+  -o, --output FILE            Save tree output to FILE
+  -e, --exclude PATTERN        Extra exclude pattern (repeatable)
+  -p, --path PATH              Specific directory or file to show (repeatable)
+  -C, --contents-file FILE     Aggregate contents of files into FILE
+  -B, --skip-binaries          Skip binary files when aggregating contents
+  -M, --max-size SIZE          Skip files larger than SIZE (e.g., 5M, 500k)
+  -f, --file-name PATTERN      Only show files matching PATTERN (e.g., "pom.xml")
+  --compact                    Show folders only (no files)
+  --desktop                    Save both tree and contents output to desktop
+  --output-desktop             Save tree output to desktop only
+  --contents-desktop           Save contents file to desktop only
+  -m, --microservices LIST     Comma-separated list of microservices to include
+      --microservices          List all microservices in project
+  -d, --dir-pattern PATTERN    Only show directories/files under dirs matching PATTERN
+  --level N                    Show structure up to level N (1=root)
+  --max-depth N                Limit directory traversal to N levels
+  --exact-level N              Show only items at exact level N
+  --include-ext EXT            Only include files with these extensions (comma-separated)
+  --exclude-ext EXT            Exclude files with these extensions
+  --shorten-paths              Shorten deep directory paths by flattening
+  --flatten-separator CHAR     Character to use when flattening paths (default: ".")
+  --shorten-level N            Start shortening after N levels (0=auto-detect)
+  --show-levels                Show level numbers in output
+  --json                       Output JSON format
+  --yaml                       Output YAML format
+  --stats                      Show statistics summary
+  --line-count                 Include total line count in --stats output
+  --changed                    Only show directories/files with git changes
+  --follow-symlinks            Follow symbolic links during traversal
+  --dry-run                    Preview content dump file list without writing
+  --watch                      Watch for changes and re-run automatically
+  --watch-interval N           Seconds between watch re-runs (default: 3)
+  --template STRING            Prepend STRING to content dumps
+                               Supports: {DATE}, {ROOT}, {LANG}, {VERSION}
+  --gitignore-full             Full .gitignore parsing (negation ! + double-star **)
+  --no-color                   Disable colorized output
+  -h, --help                   Show this help
+EOF
+}
+
+usage_micro() {
+  cat <<'EOF'
+golurk micro [options]
+
+Options:
+  -m, --microservices LIST     Select microservices by comma-separated list
+      --microservices          List all microservices in project
+  -h, --help                   Show this help
+EOF
+}
+
+usage_stats() {
+  cat <<'EOF'
+golurk stats [options]
+
+Options:
+  -p, --path PATH              Specific directory to analyze (repeatable)
+  -o, --output FILE            Save stats to FILE
+  --line-count                 Include total line count in output
+  --desktop                    Save stats output to desktop
+  --no-color                   Disable colorized output
+  -h, --help                   Show this help
+EOF
+}
+
+usage_diff() {
+  cat <<'EOF'
+golurk diff [commit]
+
+Show files changed between the working tree and a commit/branch.
+
+Arguments:
+  commit                       Commit, tag, or branch to diff against (default: HEAD)
+
+Options:
+  --staged                     Show staged (cached) changes only
+  --stat                       Show diffstat instead of file list
+  --no-color                   Disable colorized output
+  -h, --help                   Show this help
+EOF
+}
+
+version() { echo "golurk $VERSION"; }
+
+# ──────────────────────────────────────────────────────────────────────
+# Utility helpers
+# ──────────────────────────────────────────────────────────────────────
+
+escape_for_regex() {
+  sed -e 's/[.[\\^$+?(){}|]/\\&/g' -e 's/\*/.*/g' -e 's/\?/./g'
+}
+
+# Safely escape a value for embedding inside JSON/YAML double-quoted strings
+escape_json_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"   # backslashes first
+  s="${s//\"/\\\"}"   # double quotes
+  printf '%s' "$s"
+}
+
+build_tree_pattern() {
+  local -n _dirs=$1
+  local -n _files=$2
+  local pat=""
+  for d in "${_dirs[@]}"; do pat="${pat:+$pat|}$d"; done
+  for f in "${_files[@]}"; do pat="${pat:+$pat|}$f"; done
+  echo "$pat"
+}
+
+# FIX: build PRUNE_ARGS into global; call once and reuse
+build_find_prune_args() {
+  local -n _dirs=$1
+  PRUNE_ARGS=()
+  [[ ${#_dirs[@]} -eq 0 ]] && return
+  for d in "${_dirs[@]}"; do
+    PRUNE_ARGS+=( -path "*/$d" -prune -o )
+  done
+}
+
+build_grep_regex() {
+  local -n _files=$1
+  local regex=""
+  for f in "${_files[@]}"; do
+    local safe; safe=$(printf "%s" "$f" | escape_for_regex)
+    regex="${regex:+$regex|}$safe"
+  done
+  echo "$regex"
+}
+
+is_text_file() {
+  local file="$1"
+  if command -v file &>/dev/null; then
+    local mime; mime=$(file --mime-type -b -- "$file" 2>/dev/null || echo "")
+    [[ "$mime" == text/* ]] && return 0
+    case "$mime" in
+      application/json|application/xml|application/javascript|\
+      application/x-sh|application/x-shellscript|application/x-python) return 0 ;;
+      *) return 1 ;;
+    esac
+  else
+    LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1
+  fi
+}
+
+# FIX v5: validate --max-size format before it reaches find
+validate_size_arg() {
+  local val="$1"
+  if [[ ! "$val" =~ ^[0-9]+[kKmMgGbB]?$ ]]; then
+    printf "Error: Invalid size format '%s'. Use e.g. 5M, 500k, 1G\n" "$val" >&2
+    exit 1
+  fi
+}
+
+human_to_bytes() {
+  local input="$1"
+  [[ -z "$input" ]] && echo "" && return
+  if [[ "$input" =~ ^([0-9]+)([kKmMgG])?$ ]]; then
+    local num="${BASH_REMATCH[1]}" suf="${BASH_REMATCH[2]:-}"
+    case "$suf" in
+      [kK]) echo $(( num * 1024 )) ;;
+      [mM]) echo $(( num * 1024 * 1024 )) ;;
+      [gG]) echo $(( num * 1024 * 1024 * 1024 )) ;;
+      *)    echo "$num" ;;
+    esac
+  else
+    printf "%s" "$input" | sed -E 's/[^0-9].*//'
+  fi
+}
+
+# FIX v5: use git status -z so filenames with spaces are handled correctly
+get_changed_files() {
+  if command -v git &>/dev/null && git rev-parse --git-dir &>/dev/null 2>&1; then
+    git status -z --porcelain | while IFS= read -r -d '' entry; do
+      local fname="${entry:3}"
+      [[ -n "$fname" ]] && echo "$fname"
+    done || true
+  else
+    return 1
+  fi
+}
+
+format_with_levels() {
+  local path="$1"
+  [[ "$path" == "./"* ]] && path="${path#./}"
+  local level
+  if [[ -n "$path" ]]; then
+    level=$(tr -cd '/' <<< "$path" | wc -c)
+    level=$((level + 1))
+  else
+    level=1
+  fi
+  echo "$level:$path"
+}
+
+shorten_path() {
+  local path="$1"
+  [[ "$SHORTEN_PATHS" != true ]] && echo "$path" && return
+  local level_count; level_count=$(echo "$path" | tr -cd '/' | wc -c)
+  local shorten_start=$SHORTEN_LEVEL
+  [[ $SHORTEN_LEVEL -eq 0 ]] && shorten_start=3
+  [[ $level_count -le $shorten_start ]] && echo "$path" && return
+  IFS='/' read -ra parts <<< "$path"
+  local flattened="" remaining=""
+  for i in "${!parts[@]}"; do
+    if [[ $i -lt $shorten_start ]]; then
+      remaining="${remaining:+$remaining/}${parts[$i]}"
+    else
+      flattened="${flattened:+$flattened$FLATTEN_SEPARATOR}${parts[$i]}"
+    fi
+  done
+  if [[ -n "$flattened" ]]; then
+    [[ -n "$remaining" ]] && echo "$remaining/$flattened" || echo "$flattened"
+  else
+    echo "$path"
+  fi
+}
+
+# FIX: extension filter extracted into reusable function
+# Returns 0 = pass through, 1 = filtered out
+filter_by_extension() {
+  local file="$1" include="$2" exclude="$3"
+  local ext="${file##*.}"
+  if [[ -n "$include" ]]; then
+    [[ "$ext" == "$file" ]] && return 1
+    IFS=',' read -ra exts <<< "$include"
+    local found=false
+    for e in "${exts[@]}"; do
+      e="${e// /}"; [[ "$ext" == "$e" ]] && found=true && break
+    done
+    [[ "$found" = false ]] && return 1
+  fi
+  if [[ -n "$exclude" && "$ext" != "$file" ]]; then
+    IFS=',' read -ra exts <<< "$exclude"
+    for e in "${exts[@]}"; do
+      e="${e// /}"; [[ "$ext" == "$e" ]] && return 1
+    done
+  fi
+  return 0
+}
+
+# Apply --template header to a content dump file with variable substitution
+apply_template() {
+  local tmpl="$1" dest="$2"
+  local result="$tmpl"
+  result="${result//\{DATE\}/$(date '+%Y-%m-%d %H:%M:%S')}"
+  result="${result//\{ROOT\}/$PROJECT_ROOT}"
+  result="${result//\{LANG\}/${FILTER_EXTENSIONS:-auto}}"
+  result="${result//\{VERSION\}/$VERSION}"
+  printf "%s\n\n" "$result" >> "$dest"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# collect_stats  [v5: adds --line-count support]
+# FIX: replaced bc with awk for portable float arithmetic
+# ──────────────────────────────────────────────────────────────────────
+collect_stats() {
+  local -n _targets=$1
+  local -n _dir_ignores=$2
+  local -n _file_ignores=$3
+  local total_dirs=0 total_files=0 total_size=0 total_lines=0 by_extension=""
+
+  for target in "${_targets[@]}"; do
+    local dir_cmd=(find "$target" -type d)
+    for ignore in "${_dir_ignores[@]}"; do
+      dir_cmd+=( -not -path "*/$ignore/*" -not -name "$ignore" )
+    done
+    total_dirs=$((total_dirs + $("${dir_cmd[@]}" 2>/dev/null | wc -l)))
+
+    local file_cmd=(find "$target" -type f)
+    for ignore in "${_dir_ignores[@]}"; do
+      file_cmd+=( -not -path "*/$ignore/*" -not -name "$ignore" )
+    done
+
+    while IFS= read -r -d '' file; do
+      local skip=false
+      for ignore in "${_file_ignores[@]}"; do
+        [[ "$file" == *"$ignore"* ]] && skip=true && break
+      done
+      if [[ "$skip" = false ]]; then
+        total_files=$((total_files + 1))
+        if [[ -f "$file" ]]; then
+          local size; size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+          total_size=$((total_size + size))
+          local ext="${file##*.}"
+          [[ "$ext" != "$file" ]] && by_extension="$by_extension$ext "
+          # v5: optional line count (only for text files to avoid binary noise)
+          if [[ "$SHOW_LINE_COUNT" = true ]] && is_text_file "$file"; then
+            local lc; lc=$(wc -l < "$file" 2>/dev/null || echo 0)
+            total_lines=$((total_lines + lc))
+          fi
+        fi
+      fi
+    done < <("${file_cmd[@]}" -print0 2>/dev/null)
+  done
+
+  local size_human=""
+  if   [[ $total_size -ge $((1024 * 1024 * 1024)) ]]; then
+    size_human=$(awk "BEGIN { printf \"%.2f GB\", $total_size / (1024*1024*1024) }")
+  elif [[ $total_size -ge $((1024 * 1024)) ]]; then
+    size_human=$(awk "BEGIN { printf \"%.2f MB\", $total_size / (1024*1024) }")
+  elif [[ $total_size -ge 1024 ]]; then
+    size_human=$(awk "BEGIN { printf \"%.2f KB\", $total_size / 1024 }")
+  else
+    size_human="${total_size} bytes"
+  fi
+
+  local ext_stats=""
+  if [[ -n "$by_extension" ]]; then
+    ext_stats=$(echo "$by_extension" | tr ' ' '\n' | sort | uniq -c | sort -nr | head -5 \
+      | awk '{print $2 ": " $1}' | tr '\n' ', ' | sed 's/, $//')
+  fi
+
+  printf "${C_BOLD}Directories:${C_RESET}  %s\n"  "$total_dirs"
+  printf "${C_BOLD}Files:        ${C_RESET} %s\n"  "$total_files"
+  printf "${C_BOLD}Total Size:   ${C_RESET} %s\n"  "$size_human"
+  [[ "$SHOW_LINE_COUNT" = true ]] && printf "${C_BOLD}Total Lines:  ${C_RESET} %s\n" "$total_lines"
+  [[ -n "$ext_stats" ]]          && printf "${C_BOLD}Top Ext:      ${C_RESET} %s\n" "$ext_stats"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# JSON serializer  [NEW v5]
+# ──────────────────────────────────────────────────────────────────────
+output_json() {
+  local -n _lines=$1
+  local generated_at
+  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  printf '{\n'
+  printf '  "version": "%s",\n'      "$VERSION"
+  printf '  "root": "%s",\n'         "$(escape_json_string "$PROJECT_ROOT")"
+  printf '  "generated_at": "%s",\n' "$generated_at"
+  printf '  "items": [\n'
+  local count="${#_lines[@]}" i=0
+  for line in "${_lines[@]}"; do
+    local type_str="file"; [[ -d "$line" ]] && type_str="directory"
+    local level_info; level_info=$(format_with_levels "$line")
+    local level="${level_info%%:*}"
+    local rel_path="${line#./}"
+    local ext=""
+    if [[ "$type_str" = "file" ]]; then
+      local base="${rel_path##*/}"; ext="${base##*.}"; [[ "$ext" = "$base" ]] && ext=""
+    fi
+    i=$((i + 1))
+    local comma=","; [[ $i -eq $count ]] && comma=""
+    printf '    {"path": "%s", "type": "%s", "level": %s' \
+      "$(escape_json_string "$rel_path")" "$type_str" "$level"
+    [[ -n "$ext" ]] && printf ', "ext": "%s"' "$(escape_json_string "$ext")"
+    printf '}%s\n' "$comma"
+  done
+  printf '  ]\n'
+  printf '}\n'
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# YAML serializer  [NEW v5]
+# ──────────────────────────────────────────────────────────────────────
+output_yaml() {
+  local -n _lines=$1
+  local generated_at
+  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  printf 'version: "%s"\n'      "$VERSION"
+  printf 'root: "%s"\n'         "$(escape_json_string "$PROJECT_ROOT")"
+  printf 'generated_at: "%s"\n' "$generated_at"
+  printf 'items:\n'
+  for line in "${_lines[@]}"; do
+    local type_str="file"; [[ -d "$line" ]] && type_str="directory"
+    local level_info; level_info=$(format_with_levels "$line")
+    local level="${level_info%%:*}"
+    local rel_path="${line#./}"
+    local ext=""
+    if [[ "$type_str" = "file" ]]; then
+      local base="${rel_path##*/}"; ext="${base##*.}"; [[ "$ext" = "$base" ]] && ext=""
+    fi
+    printf '  - path: "%s"\n'  "$(escape_json_string "$rel_path")"
+    printf '    type: %s\n'    "$type_str"
+    printf '    level: %s\n'   "$level"
+    [[ -n "$ext" ]] && printf '    ext: %s\n' "$(escape_json_string "$ext")"
+  done
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Microservices handling
+# ──────────────────────────────────────────────────────────────────────
+list_or_select_microservices() {
+  local pattern="$1"
+  local found=0
+
+  if [[ "$SHOW_MICROSERVICES_ONLY" = true ]]; then
+    printf "${C_BOLD}Microservices in project:${C_RESET}\n"
+    echo "------------------------"
+    for item in ./*/; do
+      if [[ -d "$item" ]]; then
+        local dir_name="${item%/}"; dir_name="${dir_name#./}"
+        if [[ -f "$dir_name/pom.xml" ]] || [[ -d "$dir_name/src" ]]; then
+          printf "${C_GREEN}%s${C_RESET}\n" "$dir_name"
+          found=1
+        fi
+      fi
+    done
+    if [[ $found -eq 0 ]]; then
+      echo "No microservices found with pom.xml or src/ directory."
+      echo "Listing all top-level directories:"
+      for item in ./*/; do
+        [[ -d "$item" ]] && echo "${item#./}" | sed 's/\/$//'
+      done | sort -u
+    fi
+    return 0
+  fi
+
+  [[ -z "$pattern" ]] && return 0
+
+  IFS=',' read -ra service_names <<< "$pattern"
+  for name in "${service_names[@]}"; do
+    name="${name// /}"; name="${name%/}"
+    local found_local=false  # FIX: local to prevent global scope leak
+
+    if [[ -d "./$name-service" ]]; then
+      SELECT_PATHS+=("./$name-service"); found_local=true
+      echo "Selected: ./$name-service" >&2
+    fi
+    if [[ "$found_local" = false && -d "./$name" ]]; then
+      SELECT_PATHS+=("./$name"); found_local=true
+      echo "Selected: ./$name" >&2
+    fi
+    if [[ "$found_local" = false ]]; then
+      for dir in ./*/; do
+        dir="${dir#./}"; dir="${dir%/}"
+        if [[ "$dir" == *"$name"* ]]; then
+          SELECT_PATHS+=("./$dir"); found_local=true
+          echo "Selected by pattern: ./$dir" >&2; break
+        fi
+      done
+    fi
+    if [[ "$found_local" = false ]]; then
+      echo "Warning: Microservice '$name' not found" >&2
+      echo "Available directories:" >&2
+      for dir in ./*/; do dir="${dir#./}"; dir="${dir%/}"; echo "  $dir" >&2; done
+    fi
+  done
+
+  if [[ ${#SELECT_PATHS[@]} -eq 0 ]]; then
+    echo "Error: No microservices found matching: $pattern" >&2
+    echo "Try: golurk micro --microservices to see available microservices" >&2
+    return 1
+  fi
+  return 0
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# Read .gitignore  [v5: unified; --gitignore-full enables negation + **)
+# ──────────────────────────────────────────────────────────────────────
+read_gitignore() {
+  local gitignore="$PROJECT_ROOT/.gitignore"
+  [[ -f "$gitignore" ]] || return 0
+
+  while IFS= read -r rawline || [[ -n "$rawline" ]]; do
+    local line="${rawline%%#*}"
+    line="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+
+    # Negation: only captured in --gitignore-full mode
+    if [[ "$GITIGNORE_FULL" = true && "$line" == \!* ]]; then
+      GITIGNORE_NEGATIONS+=("${line:1}"); continue
+    fi
+
+    if [[ "$line" == */ ]]; then
+      local entry="${line%/}"; entry="${entry#./}"
+      # Double-star normalization: **/<name>/ → <name>
+      entry="${entry##**/}"
+      DIR_IGNORES+=("$entry")
+    else
+      local entry2="${line#./}"
+      entry2="${entry2##**/}"   # **/*.ext → *.ext
+      FILE_IGNORES+=("$entry2")
+    fi
+  done < "$gitignore"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# FIX: Validate that $2 exists before using it (guard for set -u)
+# ──────────────────────────────────────────────────────────────────────
+require_arg() {
+  local opt="${1:-}" val="${2:-}"
+  if [[ -z "$val" || "${val:0:1}" == "-" ]]; then
+    printf "Error: option '%s' requires a value\n" "$opt" >&2; exit 1
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# _emit_path: format and print a single path; returns 1 if level-filtered
+# ──────────────────────────────────────────────────────────────────────
+_emit_path() {
+  local line="$1"
+  local level="" path_out="$line"
+
+  if [[ -n "$SHOW_LEVEL" || -n "$EXACT_LEVEL" || "$SHOW_LEVELS" = true ]]; then
+    local level_info; level_info=$(format_with_levels "$line")
+    level="${level_info%%:*}"; path_out="${level_info#*:}"
+    if [[ -n "$EXACT_LEVEL" && "$level" -ne "$EXACT_LEVEL" ]]; then return 1; fi
+    if [[ -n "$SHOW_LEVEL"  && "$level" -gt "$SHOW_LEVEL"  ]]; then return 1; fi
+  fi
+
+  [[ "$SHORTEN_PATHS" = true ]] && path_out=$(shorten_path "$path_out")
+
+  if [[ "$SHOW_LEVELS" = true && -n "$level" ]]; then
+    printf "[L%s] %s\n" "$level" "$path_out"
+  else
+    echo "$path_out"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# process_find_output: filter and emit a single find result line
+# FIX: uses filter_by_extension() instead of inline duplicated logic
+# FIX: DIR_PATTERN now actually applied
+# FIX: level/shorten logic unified (no duplicated branches)
+# NEW v5: negation bypass for --gitignore-full
+# ──────────────────────────────────────────────────────────────────────
+process_find_output() {
+  local line="$1"
+  [[ -z "$line" ]] && return 1
+
+  # Negation bypass: if path matches a ! pattern it is always shown
+  if [[ ${#GITIGNORE_NEGATIONS[@]} -gt 0 ]]; then
+    for neg in "${GITIGNORE_NEGATIONS[@]}"; do
+      if echo "$line" | grep -qF "$neg"; then
+        _emit_path "$line" || return 1
+        return 0
+      fi
+    done
+  fi
+
+  # Apply file ignores via grep regex
+  if [[ -n "$GREP_REGEX" && "$SELECT_FILES_ONLY" != true ]]; then
+    if echo "$line" | grep -E -q "$GREP_REGEX"; then return 1; fi
+  fi
+
+  # FIX: DIR_PATTERN filtering — skip entries not under a matching directory
+  if [[ -n "$DIR_PATTERN" ]]; then
+    if ! echo "$line" | grep -qE "(^|/)$DIR_PATTERN(/|$)"; then return 1; fi
+  fi
+
+  # Extension filters (files only)
+  if [[ -f "$line" ]]; then
+    filter_by_extension "$line" "$FILTER_EXTENSIONS" "$EXCLUDE_EXTENSIONS" || return 1
+  fi
+
+  _emit_path "$line" || return 1
+  return 0
+}
+
+# Colorized variant — wraps process_find_output; used when writing to a TTY
+process_find_output_color() {
+  local line="$1"
+  local result; result=$(process_find_output "$line") || return 1
+  [[ -z "$result" ]] && return 1
+  if [[ -d "$line" ]]; then
+    printf "${C_DIR}%s${C_RESET}\n" "$result"
+  else
+    printf "${C_FILE}%s${C_RESET}\n" "$result"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# run_find_for_target: find with correct operator precedence
+# FIX: wraps -type d -o -type f in \( \) so -print applies to both types
+# NEW v5: -L flag for --follow-symlinks
+# ──────────────────────────────────────────────────────────────────────
+run_find_for_target() {
+  local target="$1"
+  local -a find_cmd=(find)
+  [[ "$FOLLOW_SYMLINKS" = true ]] && find_cmd+=(-L)
+  find_cmd+=("$target")
+  [[ -n "$MAX_DEPTH" ]] && find_cmd+=(-maxdepth "$MAX_DEPTH")
+
+  if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
+    find_cmd+=(-type f -name "$FILE_NAME_PATTERN")
+  else
+    if [[ "$SHOW_FILES" = false ]]; then
+      find_cmd+=(-type d)
+    else
+      # FIX: correct precedence — grouping required for -print to apply to both
+      find_cmd+=(\( -type d -o -type f \))
+    fi
+  fi
+
+  if [[ ${#PRUNE_ARGS[@]} -eq 0 ]]; then
+    find_cmd+=(-print)
+  else
+    find_cmd+=("${PRUNE_ARGS[@]}" -print)
+  fi
+  "${find_cmd[@]}"
+}
+
+# ──────────────────────────────────────────────────────────────────────
+# golurk diff  [NEW v5]
+# ──────────────────────────────────────────────────────────────────────
+run_diff_command() {
+  local base="$1" staged_only="$2" show_stat="$3"
+
+  if ! command -v git &>/dev/null; then
+    echo "Error: git is not available" >&2; exit 1
+  fi
+  if ! git rev-parse --git-dir &>/dev/null 2>&1; then
+    echo "Error: Not a git repository" >&2; exit 1
+  fi
+
+  local -a diff_args
+  if [[ "$show_stat" = true ]]; then
+    diff_args=(git diff --stat)
+    [[ "$staged_only" = true ]] && diff_args+=(--cached)
+  else
+    diff_args=(git diff --name-only)
+    [[ "$staged_only" = true ]] && diff_args+=(--cached)
+  fi
+  diff_args+=("$base")
+
+  printf "${C_BOLD}Changed files vs %s:${C_RESET}\n" "$base"
+  echo "------------------------------"
+
+  local count=0
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    if   [[ -d "$file" ]]; then printf "${C_DIR}%s/${C_RESET}\n"          "$file"
+    elif [[ -f "$file" ]]; then printf "${C_GREEN}%s${C_RESET}\n"         "$file"
+    else                        printf "${C_DIM}%s (deleted)${C_RESET}\n" "$file"
+    fi
+    count=$((count + 1))
+  done < <("${diff_args[@]}" 2>/dev/null || true)
+
+  if [[ $count -eq 0 ]]; then
+    printf "${C_DIM}No changes found vs %s${C_RESET}\n" "$base"
+  else
+    printf "\n${C_BOLD}Total: %d file(s) changed${C_RESET}\n" "$count"
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# Main parser & command dispatch
+# ══════════════════════════════════════════════════════════════════════
+
+# Load project-level config before arg parsing so CLI can override it
+load_golurkrc
+
+if [[ $# -eq 0 ]]; then banner; exit 0; fi
+
+COMMAND="$1"; shift
+
+case "$COMMAND" in
+  -h|--help)  banner;  exit 0 ;;
+  --version)  version; exit 0 ;;
+
+  # ────────────────────────────────────────────────────────────────────
+  tree)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -o|--output)         require_arg "$1" "${2:-}"; OUTPUT_FILE="$2"; shift 2 ;;
+        -e|--exclude)        require_arg "$1" "${2:-}"; EXTRA_EXCLUDES+=("$2"); shift 2 ;;
+        -p|--path)           require_arg "$1" "${2:-}"; SELECT_PATHS+=("$2"); shift 2 ;;
+        -C|--contents-file)  require_arg "$1" "${2:-}"; DUMP_CONTENTS=true; CONTENTS_FILE="$2"; shift 2 ;;
+        -B|--skip-binaries)  SKIP_BINARIES=true; shift ;;
+        -M|--max-size)       require_arg "$1" "${2:-}"; validate_size_arg "${2:-}"; MAX_SIZE="$2"; shift 2 ;;
+        # FIX: -f/--file-name now wired up
+        -f|--file-name)      require_arg "$1" "${2:-}"; FILE_NAME_PATTERN="$2"; SELECT_FILES_ONLY=true; shift 2 ;;
+        -d|--dir-pattern)    require_arg "$1" "${2:-}"; DIR_PATTERN="$2"; shift 2 ;;
+        --compact)           SHOW_FILES=false; shift ;;
+        --desktop)           OUTPUT_TO_DESKTOP=true; CONTENTS_TO_DESKTOP=true; shift ;;
+        --output-desktop)    OUTPUT_TO_DESKTOP=true; shift ;;
+        --contents-desktop)  CONTENTS_TO_DESKTOP=true; shift ;;
+        # FIX: guard against unset $2 under set -u
+        -m|--microservices)
+          if [[ $# -gt 1 && -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+            MICROSERVICE_PATTERN="$2"; shift 2
+          else
+            SHOW_MICROSERVICES_ONLY=true; shift
+          fi ;;
+        --microservices)     SHOW_MICROSERVICES_ONLY=true; shift ;;
+        --level)             require_arg "$1" "${2:-}"; SHOW_LEVEL="$2"; shift 2 ;;
+        --max-depth)         require_arg "$1" "${2:-}"; MAX_DEPTH="$2"; shift 2 ;;
+        --exact-level)       require_arg "$1" "${2:-}"; EXACT_LEVEL="$2"; shift 2 ;;
+        --show-levels)       SHOW_LEVELS=true; shift ;;
+        --json)              USE_JSON=true; shift ;;
+        --yaml)              USE_YAML=true; shift ;;
+        --stats)             SHOW_STATS=true; shift ;;
+        --line-count)        SHOW_LINE_COUNT=true; shift ;;
+        --include-ext)       require_arg "$1" "${2:-}"; FILTER_EXTENSIONS="$2"; shift 2 ;;
+        --exclude-ext)       require_arg "$1" "${2:-}"; EXCLUDE_EXTENSIONS="$2"; shift 2 ;;
+        --changed)           ONLY_CHANGED=true; shift ;;
+        --shorten-paths)     SHORTEN_PATHS=true; shift ;;
+        --flatten-separator) require_arg "$1" "${2:-}"; FLATTEN_SEPARATOR="$2"; shift 2 ;;
+        --shorten-level)     require_arg "$1" "${2:-}"; SHORTEN_LEVEL="$2"; shift 2 ;;
+        --follow-symlinks)   FOLLOW_SYMLINKS=true; shift ;;
+        --dry-run)           DRY_RUN=true; shift ;;
+        --watch)             WATCH_MODE=true; shift ;;
+        --watch-interval)    require_arg "$1" "${2:-}"; WATCH_INTERVAL="$2"; shift 2 ;;
+        --template)          require_arg "$1" "${2:-}"; CONTENT_TEMPLATE="$2"; shift 2 ;;
+        --gitignore-full)    GITIGNORE_FULL=true; shift ;;
+        --no-color)          NO_COLOR=true; setup_colors; shift ;;
+        -h|--help)           usage_tree; exit 0 ;;
+        *)                   printf "Error: Unknown option: %s\n" "$1" >&2; usage_tree; exit 1 ;;
+      esac
+    done
+
+    # Validate conflicting options
+    if [[ "$USE_JSON" = true && "$USE_YAML" = true ]]; then
+      echo "Error: Cannot use both --json and --yaml" >&2; exit 1
+    fi
+    if [[ -n "$SHOW_LEVEL" && -n "$EXACT_LEVEL" ]]; then
+      echo "Error: Cannot use both --level and --exact-level together" >&2; exit 1
+    fi
+    if [[ "$SELECT_FILES_ONLY" = true && "$SHOW_FILES" = false ]]; then
+      echo "Warning: --compact conflicts with -f/--file-name. Showing files anyway." >&2
+      SHOW_FILES=true
+    fi
+
+    read_gitignore
+
+    # Add user-specified excludes
+    for ex in "${EXTRA_EXCLUDES[@]}"; do
+      if   [[ "$ex" == */ ]];                         then ex="${ex%/}"; DIR_IGNORES+=("$ex")
+      elif [[ "$ex" == *'*'* || "$ex" == *'?'* ]];   then FILE_IGNORES+=("$ex")
+      else DIR_IGNORES+=("$ex")
+      fi
+    done
+
+    # Microservices listing/selection
+    if [[ -n "$MICROSERVICE_PATTERN" || "$SHOW_MICROSERVICES_ONLY" = true ]]; then
+      list_or_select_microservices "$MICROSERVICE_PATTERN"
+      [[ "$SHOW_MICROSERVICES_ONLY" = true ]] && exit 0
+    fi
+
+    # Changed files
+    if [[ "$ONLY_CHANGED" = true ]]; then
+      if changed_files=$(get_changed_files); then
+        mapfile -t changed_arr <<< "$changed_files"
+        [[ ${#changed_arr[@]} -eq 0 ]] && echo "No changed files found" >&2 && exit 0
+        SELECT_PATHS=()
+        for f in "${changed_arr[@]}"; do
+          [[ -n "$f" && -e "$f" ]] && SELECT_PATHS+=("$f")
+        done
+      else
+        echo "Error: Not a git repository or git not available" >&2; exit 1
+      fi
+    fi
+
+    # Determine initial targets
+    if [[ ${#SELECT_PATHS[@]} -gt 0 ]]; then
+      INITIAL_TARGETS=("${SELECT_PATHS[@]}")
+    else
+      INITIAL_TARGETS=(".")
+    fi
+
+    # Resolve output paths
+    if [[ -n "$OUTPUT_FILE" && "$OUTPUT_TO_DESKTOP" = true ]]; then
+      OUTPUT_FILE="$DESKTOP_PATH/$(basename "$OUTPUT_FILE")"
+      printf "Output will be saved to: %s\n" "$(print_saved_path "$OUTPUT_FILE")" >&2
+    fi
+    if [[ "$DUMP_CONTENTS" = true && -n "$CONTENTS_FILE" && "$CONTENTS_TO_DESKTOP" = true ]]; then
+      CONTENTS_FILE="$DESKTOP_PATH/$(basename "$CONTENTS_FILE")"
+      printf "Contents will be saved to: %s\n" "$(print_saved_path "$CONTENTS_FILE")" >&2
+    fi
+    if [[ "$OUTPUT_TO_DESKTOP" = true && -z "$OUTPUT_FILE" ]]; then
+      OUTPUT_FILE="$DESKTOP_PATH/project-structure-$(date +%Y%m%d-%H%M%S).txt"
+      printf "Auto-generated output file: %s\n" "$(print_saved_path "$OUTPUT_FILE")" >&2
+    fi
+
+    # FIX: build shared state ONCE; reused in both tree pass and contents pass
+    TREE_PATTERN="$(build_tree_pattern DIR_IGNORES FILE_IGNORES)"
+    build_find_prune_args DIR_IGNORES
+    GREP_REGEX="$(build_grep_regex FILE_IGNORES)"
+
+    # ── Watch mode: strip --watch flags then loop with re-exec ─────────
+    if [[ "$WATCH_MODE" = true ]]; then
+      REWATCH_ARGS=()
+      skip_next=false
+      for arg in "${ORIGINAL_ARGS[@]}"; do
+        if [[ "$skip_next" = true ]]; then skip_next=false; continue; fi
+        if [[ "$arg" = "--watch" ]]; then continue; fi
+        if [[ "$arg" = "--watch-interval" ]]; then skip_next=true; continue; fi
+        REWATCH_ARGS+=("$arg")
+      done
+      trap 'printf "\nWatch stopped.\n"; exit 0' INT TERM
+      while true; do
+        clear 2>/dev/null || true
+        printf "${C_BOLD}[golurk watch]${C_RESET} ${C_DIM}$(date '+%H:%M:%S') · every ${WATCH_INTERVAL}s · Ctrl+C to stop${C_RESET}\n\n"
+        "$SCRIPT_PATH" "${REWATCH_ARGS[@]}" 2>&1 || true
+        sleep "$WATCH_INTERVAL"
+      done
+    fi
+
+    # ── Structured output: JSON / YAML (buffer first, then serialize) ──
+    if [[ "$USE_JSON" = true || "$USE_YAML" = true ]]; then
+      mapfile -t OUTPUT_LINES < <(
+        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+          | while IFS= read -r line; do process_find_output "$line" || true; done
+      )
+      if [[ "$USE_JSON" = true ]]; then
+        if [[ -z "$OUTPUT_FILE" ]]; then
+          output_json OUTPUT_LINES
+        else
+          output_json OUTPUT_LINES > "$OUTPUT_FILE"
+          printf "✅ JSON structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
+        fi
+      else
+        if [[ -z "$OUTPUT_FILE" ]]; then
+          output_yaml OUTPUT_LINES
+        else
+          output_yaml OUTPUT_LINES > "$OUTPUT_FILE"
+          printf "✅ YAML structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
+        fi
+      fi
+      exit 0
+    fi
+
+    # ── Standard tree output ───────────────────────────────────────────
+    use_color=false
+    [[ "$NO_COLOR" != true && -t 1 ]] && use_color=true
+
+    if command -v tree &>/dev/null && [[ "$SHORTEN_PATHS" != true ]]; then
+      TREE_OPTS=(tree -a)
+      if [[ -n "$SHOW_LEVEL" ]]; then
+        TREE_OPTS+=(-L "$SHOW_LEVEL")
+      elif [[ -n "$MAX_DEPTH" ]]; then
+        TREE_OPTS+=(-L "$MAX_DEPTH")
+      fi
+      [[ "$SHOW_FILES" = false ]]     && TREE_OPTS+=(-d)
+      [[ "$FOLLOW_SYMLINKS" = true ]] && TREE_OPTS+=(-l)
+      [[ -n "$TREE_PATTERN" ]]        && TREE_OPTS+=(-I "$TREE_PATTERN")
+      TREE_OPTS+=("${INITIAL_TARGETS[@]}")
+
+      if [[ -z "$OUTPUT_FILE" ]]; then
+        "${TREE_OPTS[@]}"
+      else
+        "${TREE_OPTS[@]}" > "$OUTPUT_FILE"
+        printf "✅ Project structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
+      fi
+    else
+      # find fallback (with optional ANSI color when writing to a TTY)
+      if [[ -z "$OUTPUT_FILE" ]]; then
+        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+          | while IFS= read -r line; do
+              if [[ "$use_color" = true ]]; then
+                process_find_output_color "$line" || true
+              else
+                process_find_output "$line" || true
+              fi
+            done
+      else
+        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+          | while IFS= read -r line; do process_find_output "$line" || true; done \
+          > "$OUTPUT_FILE"
+        printf "✅ Project structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
+      fi
+    fi
+
+    # ── Aggregate file contents (-C) ───────────────────────────────────
+    if [[ "$DUMP_CONTENTS" = true ]]; then
+      [[ -z "$CONTENTS_FILE" ]] && {
+        echo "Error: contents file not provided. Use -C <filename> or --contents-file <filename>." >&2
+        exit 1
+      }
+
+      # FIX: avoid double-prefix when CONTENTS_FILE is already an absolute path
+      if   [[ "$CONTENTS_FILE" == /* ]];          then CONTENTS_FILE_PATH="$CONTENTS_FILE"
+      elif [[ "$CONTENTS_TO_DESKTOP" = true ]];   then CONTENTS_FILE_PATH="$CONTENTS_FILE"
+      else CONTENTS_FILE_PATH="$PROJECT_ROOT/$CONTENTS_FILE"
+      fi
+
+      # --dry-run: list files that would be included, then exit
+      if [[ "$DRY_RUN" = true ]]; then
+        printf "${C_BOLD}[DRY RUN]${C_RESET} Would write contents to: %s\n" \
+          "$(print_saved_path "$CONTENTS_FILE_PATH")"
+        printf "${C_BOLD}Files that would be included:${C_RESET}\n"
+        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+          | while IFS= read -r line; do
+              [[ -f "$line" ]] || continue
+              [[ -n "$GREP_REGEX" ]] && printf '%s' "$line" | grep -E -q "$GREP_REGEX" && continue
+              filter_by_extension "$line" "$FILTER_EXTENSIONS" "$EXCLUDE_EXTENSIONS" || continue
+              printf "  ${C_GREEN}%s${C_RESET}\n" "$line"
+            done
+        exit 0
+      fi
+
+      # FIX: detect GNU find properly (functional test, not --version)
+      SIZE_EXPR=()
+      if [[ -n "$MAX_SIZE" ]]; then
+        if find . -maxdepth 0 -size +0c &>/dev/null 2>&1; then
+          SIZE_EXPR=( ! -size +"${MAX_SIZE}" )
+        else
+          BYTES=$(human_to_bytes "$MAX_SIZE")
+          [[ -n "$BYTES" ]] && SIZE_EXPR=( ! -size +"${BYTES}c" )
+        fi
+      fi
+
+      : > "$CONTENTS_FILE_PATH" || { echo "Failed to write to $CONTENTS_FILE_PATH" >&2; exit 1; }
+
+      # Inject template header if --template was given
+      [[ -n "$CONTENT_TEMPLATE" ]] && apply_template "$CONTENT_TEMPLATE" "$CONTENTS_FILE_PATH"
+
+      TMP_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_tmp.XXXXXX")"
+      trap 'rm -f "$TMP_LIST"' EXIT
+
+      run_find_files_for_target() {
+        local target="$1"
+        local -a find_cmd=(find)
+        [[ "$FOLLOW_SYMLINKS" = true ]] && find_cmd+=(-L)
+        find_cmd+=("$target")
+        [[ -n "$MAX_DEPTH" ]] && find_cmd+=(-maxdepth "$MAX_DEPTH")
+        [[ ${#PRUNE_ARGS[@]} -gt 0 ]] && find_cmd+=("${PRUNE_ARGS[@]}")
+        if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
+          find_cmd+=(-type f -name "$FILE_NAME_PATTERN")
+        else
+          find_cmd+=(-type f)
+        fi
+        [[ ${#SIZE_EXPR[@]} -gt 0 ]] && find_cmd+=("${SIZE_EXPR[@]}")
+        find_cmd+=(-print0)
+        "${find_cmd[@]}"
+      }
+
+      for t in "${INITIAL_TARGETS[@]}"; do
+        run_find_files_for_target "$t" >> "$TMP_LIST" 2>/dev/null || true
+      done
+
+      if [[ -s "$TMP_LIST" ]]; then
+        while IFS= read -r -d '' file; do
+          [[ -f "$file" ]] || continue
+
+          if [[ -n "$GREP_REGEX" ]]; then
+            if printf '%s' "$file" | grep -E -q "$GREP_REGEX"; then continue; fi
+          fi
+
+          # FIX: use shared filter_by_extension() — no more inline duplicate
+          if [[ -n "$FILTER_EXTENSIONS" || -n "$EXCLUDE_EXTENSIONS" ]]; then
+            filter_by_extension "$file" "$FILTER_EXTENSIONS" "$EXCLUDE_EXTENSIONS" || continue
+          fi
+
+          if [[ "$SKIP_BINARIES" = true ]]; then
+            if ! is_text_file "$file"; then
+              printf "\n----- SKIPPED BINARY: %s -----\n" "$file" >> "$CONTENTS_FILE_PATH"
+              printf "[Skipped binary file: %s]\n"          "$file" >> "$CONTENTS_FILE_PATH"
+              continue
+            fi
+          fi
+
+          header_path="$file"
+          [[ "$SHORTEN_PATHS" = true ]] && header_path=$(shorten_path "$file")
+          printf "\n----- FILE: %s -----\n" "$header_path" >> "$CONTENTS_FILE_PATH"
+          cat -- "$file" >> "$CONTENTS_FILE_PATH" 2>/dev/null \
+            || printf "\n[Could not read file: %s]\n" "$file" >> "$CONTENTS_FILE_PATH"
+        done < "$TMP_LIST"
+      fi
+
+      printf "✅ All file contents saved to %s\n" "$(print_saved_path "$CONTENTS_FILE_PATH")"
+      [[ "$SKIP_BINARIES" = true ]]                                  && printf "ℹ️  Note: binary files were skipped.\n" >&2
+      [[ -n "$MAX_SIZE" ]]                                           && printf "ℹ️  Note: files larger than %s were excluded.\n" "$MAX_SIZE" >&2
+      [[ -n "$DIR_PATTERN" ]]                                        && printf "ℹ️  Note: only files within dirs matching '%s' were included.\n" "$DIR_PATTERN" >&2
+      [[ -n "$MAX_DEPTH" ]]                                          && printf "ℹ️  Note: only files up to depth %s were included.\n" "$MAX_DEPTH" >&2
+      [[ -n "$FILTER_EXTENSIONS" ]]                                  && printf "ℹ️  Note: only files with extensions: %s were included.\n" "$FILTER_EXTENSIONS" >&2
+      [[ -n "$EXCLUDE_EXTENSIONS" ]]                                 && printf "ℹ️  Note: files with extensions: %s were excluded.\n" "$EXCLUDE_EXTENSIONS" >&2
+      [[ "$ONLY_CHANGED" = true ]]                                   && printf "ℹ️  Note: only changed files were included (per --changed).\n" >&2
+      [[ "$SHORTEN_PATHS" = true ]]                                  && printf "ℹ️  Note: file paths were shortened (per --shorten-paths).\n" >&2
+      [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]  && printf "ℹ️  Note: only files matching '%s' were included.\n" "$FILE_NAME_PATTERN" >&2
+      [[ -n "$CONTENT_TEMPLATE" ]]                                   && printf "ℹ️  Note: template header was injected.\n" >&2
+    fi
+
+    # Show statistics
+    if [[ "$SHOW_STATS" = true ]]; then
+      TARGETS_TO_STATS=("${INITIAL_TARGETS[@]}")
+      collect_stats TARGETS_TO_STATS DIR_IGNORES FILE_IGNORES
+    fi
+
+    exit 0
+    ;;
+
+  # ────────────────────────────────────────────────────────────────────
+  micro)
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        # FIX: guard $2 under set -u; bare -m without value now gives clear error
+        -m|--microservices)
+          if [[ $# -gt 1 && -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+            MICROSERVICE_PATTERN="$2"; shift 2
+          else
+            echo "Error: -m/--microservices requires a service name list (use --microservices to list all)" >&2
+            exit 1
+          fi ;;
+        --microservices) SHOW_MICROSERVICES_ONLY=true; shift ;;
+        -h|--help)       usage_micro; exit 0 ;;
+        *)               printf "Error: Unknown option: %s\n" "$1" >&2; usage_micro; exit 1 ;;
+      esac
+    done
+    list_or_select_microservices "${MICROSERVICE_PATTERN:-}"
+    exit 0
+    ;;
+
+  # ────────────────────────────────────────────────────────────────────
+  stats)
+    STAT_PATHS=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -p|--path)    require_arg "$1" "${2:-}"; STAT_PATHS+=("$2"); shift 2 ;;
+        -o|--output)  require_arg "$1" "${2:-}"; STATS_OUTPUT_FILE="$2"; shift 2 ;;
+        --desktop)    OUTPUT_TO_DESKTOP=true; shift ;;
+        --line-count) SHOW_LINE_COUNT=true; shift ;;
+        --no-color)   NO_COLOR=true; setup_colors; shift ;;
+        -h|--help)    usage_stats; exit 0 ;;
+        *)            printf "Error: Unknown option: %s\n" "$1" >&2; usage_stats; exit 1 ;;
+      esac
+    done
+    [[ ${#STAT_PATHS[@]} -eq 0 ]] && STAT_PATHS=(".")
+
+    # FIX v5: stats --desktop now writes to a file (was always stdout before)
+    if [[ "$OUTPUT_TO_DESKTOP" = true && -z "$STATS_OUTPUT_FILE" ]]; then
+      STATS_OUTPUT_FILE="$DESKTOP_PATH/golurk-stats-$(date +%Y%m%d-%H%M%S).txt"
+      printf "Stats will be saved to: %s\n" "$(print_saved_path "$STATS_OUTPUT_FILE")" >&2
+    fi
+
+    if [[ -n "$STATS_OUTPUT_FILE" ]]; then
+      collect_stats STAT_PATHS DIR_IGNORES FILE_IGNORES > "$STATS_OUTPUT_FILE"
+      printf "✅ Stats saved to %s\n" "$(print_saved_path "$STATS_OUTPUT_FILE")"
+    else
+      collect_stats STAT_PATHS DIR_IGNORES FILE_IGNORES
+    fi
+    exit 0
+    ;;
+
+  # ────────────────────────────────────────────────────────────────────
+  diff)
+    DIFF_BASE="HEAD"
+    DIFF_STAGED=false
+    DIFF_STAT=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --staged)   DIFF_STAGED=true; shift ;;
+        --stat)     DIFF_STAT=true; shift ;;
+        --no-color) NO_COLOR=true; setup_colors; shift ;;
+        -h|--help)  usage_diff; exit 0 ;;
+        -*)         printf "Error: Unknown option: %s\n" "$1" >&2; usage_diff; exit 1 ;;
+        *)          DIFF_BASE="$1"; shift ;;
+      esac
+    done
+    run_diff_command "$DIFF_BASE" "$DIFF_STAGED" "$DIFF_STAT"
+    exit 0
+    ;;
+
+  *)
+    printf "Error: Unknown command: %s\n" "$COMMAND" >&2
+    banner; exit 1
+    ;;
+esac
