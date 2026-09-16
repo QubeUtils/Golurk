@@ -122,8 +122,21 @@ load_golurkrc() {
     if [[ "$stripped" =~ ^[A-Z_][A-Z0-9_]*(=|\+=) ]] \
        && [[ "$stripped" != *'$('* ]] \
        && [[ "$stripped" != *'`'* ]]; then
-      eval "$stripped" 2>/dev/null \
-        || printf "Warning: .golurkrc line failed to apply: %s\n" "$stripped" >&2
+      
+      local key="${stripped%%=*}"
+      local value="${stripped#*=}"
+      
+      # Strip leading/trailing quotes
+      value="${value%\"}"; value="${value#\"}"
+      value="${value%\'}"; value="${value#\'}"
+      
+      # Handle += operator
+      if [[ "${stripped%%=*}" == *+ ]]; then
+         key="${key%+}"
+         declare -g "$key=${!key:-}$value"
+      else
+         declare -g "$key=$value"
+      fi
     else
       printf "Warning: .golurkrc line ignored (unsafe/unrecognized): %s\n" "$stripped" >&2
     fi
