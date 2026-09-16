@@ -1,6 +1,8 @@
-# golurk ⚡
+# Golurk
 
-> **Project Structure Analyzer — visualize trees, aggregate code, and scope to microservices.**
+<img width="1584" height="396" alt="Image" src="https://github.com/user-attachments/assets/d0f41175-51ad-4df9-911c-e2818fb54720" />
+
+> **Project Structure Analyser; visualise trees, aggregate code, and scope to microservices.**
 
 `golurk` is a lightning-fast, zero-dependency bash tool designed for modern development workflows. It goes beyond the classic `tree` command by allowing you to easily dump file contents for LLM context, target specific microservices in a monorepo, output structured JSON/YAML, watch for live changes, and save artifacts directly to your desktop — all while natively bridging Linux/macOS and WSL/Windows.
 
