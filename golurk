@@ -75,6 +75,7 @@ CONTENT_TEMPLATE=""
 GITIGNORE_FULL=false
 NO_COLOR=false
 STATS_OUTPUT_FILE=""
+USE_CLIPBOARD=false
 
 # ── Default ignores ───────────────────────────────────────────────────
 DIR_IGNORES=( "node_modules" ".next" ".git" "__pycache__" ".idea" ".vscode" "target" "build" "dist" "out" ".gradle" )
@@ -257,6 +258,7 @@ Options:
   --template STRING            Prepend STRING to content dumps
                                Supports: {DATE}, {ROOT}, {LANG}, {VERSION}
   --gitignore-full             Full .gitignore parsing (negation ! + double-star **)
+  --clip                       Copy final output to system clipboard
   --no-color                   Disable colorized output
   -h, --help                   Show this help
 EOF
@@ -309,6 +311,21 @@ version() { echo "golurk $VERSION"; }
 # ──────────────────────────────────────────────────────────────────────
 # Utility helpers
 # ──────────────────────────────────────────────────────────────────────
+
+copy_to_clipboard() {
+  if command -v clip.exe &>/dev/null; then
+    clip.exe
+  elif command -v pbcopy &>/dev/null; then
+    pbcopy
+  elif command -v xclip &>/dev/null; then
+    xclip -selection clipboard
+  elif command -v xsel &>/dev/null; then
+    xsel --clipboard --input
+  else
+    cat > /dev/null
+    echo "Warning: No clipboard utility found (clip.exe, pbcopy, xclip, xsel)" >&2
+  fi
+}
 
 escape_for_regex() {
   sed -e 's/[.[\\^$+?(){}|]/\\&/g' -e 's/\*/.*/g' -e 's/\?/./g'
@@ -918,6 +935,7 @@ case "$COMMAND" in
         --watch-interval)    require_arg "$1" "${2:-}"; WATCH_INTERVAL="$2"; shift 2 ;;
         --template)          require_arg "$1" "${2:-}"; CONTENT_TEMPLATE="$2"; shift 2 ;;
         --gitignore-full)    GITIGNORE_FULL=true; shift ;;
+        --clip)              USE_CLIPBOARD=true; shift ;;
         --no-color)          NO_COLOR=true; setup_colors; shift ;;
         -h|--help)           usage_tree; exit 0 ;;
         *)                   printf "Error: Unknown option: %s\n" "$1" >&2; usage_tree; exit 1 ;;
@@ -1037,7 +1055,7 @@ case "$COMMAND" in
 
     # ── Standard tree output ───────────────────────────────────────────
     use_color=false
-    [[ "$NO_COLOR" != true && -t 1 ]] && use_color=true
+    [[ "$NO_COLOR" != true && -t 1 && "$USE_CLIPBOARD" != true ]] && use_color=true
 
     if command -v tree &>/dev/null && [[ "$SHORTEN_PATHS" != true ]]; then
       TREE_OPTS=(tree -a)
@@ -1051,7 +1069,10 @@ case "$COMMAND" in
       [[ -n "$TREE_PATTERN" ]]        && TREE_OPTS+=(-I "$TREE_PATTERN")
       TREE_OPTS+=("${INITIAL_TARGETS[@]}")
 
-      if [[ -z "$OUTPUT_FILE" ]]; then
+      if [[ "$USE_CLIPBOARD" = true ]]; then
+        "${TREE_OPTS[@]}" | copy_to_clipboard
+        printf "✅ Project structure copied to clipboard\n"
+      elif [[ -z "$OUTPUT_FILE" ]]; then
         "${TREE_OPTS[@]}"
       else
         "${TREE_OPTS[@]}" > "$OUTPUT_FILE"
@@ -1059,7 +1080,12 @@ case "$COMMAND" in
       fi
     else
       # find fallback (with optional ANSI color when writing to a TTY)
-      if [[ -z "$OUTPUT_FILE" ]]; then
+      if [[ "$USE_CLIPBOARD" = true ]]; then
+        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+          | while IFS= read -r line; do process_find_output "$line" || true; done \
+          | copy_to_clipboard
+        printf "✅ Project structure copied to clipboard\n"
+      elif [[ -z "$OUTPUT_FILE" ]]; then
         for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
           | while IFS= read -r line; do
               if [[ "$use_color" = true ]]; then
@@ -1173,7 +1199,12 @@ case "$COMMAND" in
         done < "$TMP_LIST"
       fi
 
-      printf "✅ All file contents saved to %s\n" "$(print_saved_path "$CONTENTS_FILE_PATH")"
+      if [[ "$USE_CLIPBOARD" = true ]]; then
+        cat -- "$CONTENTS_FILE_PATH" | copy_to_clipboard
+        printf "✅ All file contents copied to clipboard (also saved to %s)\n" "$(print_saved_path "$CONTENTS_FILE_PATH")"
+      else
+        printf "✅ All file contents saved to %s\n" "$(print_saved_path "$CONTENTS_FILE_PATH")"
+      fi
       [[ "$SKIP_BINARIES" = true ]]                                  && printf "ℹ️  Note: binary files were skipped.\n" >&2
       [[ -n "$MAX_SIZE" ]]                                           && printf "ℹ️  Note: files larger than %s were excluded.\n" "$MAX_SIZE" >&2
       [[ -n "$DIR_PATTERN" ]]                                        && printf "ℹ️  Note: only files within dirs matching '%s' were included.\n" "$DIR_PATTERN" >&2
