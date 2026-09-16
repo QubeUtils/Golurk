@@ -908,11 +908,12 @@ case "$COMMAND" in
         --output-desktop)    OUTPUT_TO_DESKTOP=true; shift ;;
         --contents-desktop)  CONTENTS_TO_DESKTOP=true; shift ;;
         # FIX: guard against unset $2 under set -u
-        -m|--microservices)
+        -m)
           if [[ $# -gt 1 && -n "${2:-}" && "${2:0:1}" != "-" ]]; then
             MICROSERVICE_PATTERN="$2"; shift 2
           else
-            SHOW_MICROSERVICES_ONLY=true; shift
+            printf "Error: -m requires a service name list (use --microservices to list all)\n" >&2
+            exit 1
           fi ;;
         --microservices)     SHOW_MICROSERVICES_ONLY=true; shift ;;
         --level)             require_arg "$1" "${2:-}"; SHOW_LEVEL="$2"; shift 2 ;;
@@ -1261,11 +1262,11 @@ case "$COMMAND" in
     while [[ $# -gt 0 ]]; do
       case "$1" in
         # FIX: guard $2 under set -u; bare -m without value now gives clear error
-        -m|--microservices)
+        -m)
           if [[ $# -gt 1 && -n "${2:-}" && "${2:0:1}" != "-" ]]; then
             MICROSERVICE_PATTERN="$2"; shift 2
           else
-            echo "Error: -m/--microservices requires a service name list (use --microservices to list all)" >&2
+            echo "Error: -m requires a service name list (use --microservices to list all)" >&2
             exit 1
           fi ;;
         --microservices) SHOW_MICROSERVICES_ONLY=true; shift ;;
