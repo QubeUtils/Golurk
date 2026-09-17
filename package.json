@@ -1,0 +1,30 @@
+{
+  "name": "golurk",
+  "version": "1.0.0",
+  "description": "Full featured Project Structure Analyzer & LLM Context Builder",
+  "main": "golurk",
+  "bin": {
+    "golurk": "./golurk"
+  },
+  "scripts": {
+    "test": "bats tests/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/QubeUtils/Golurk.git"
+  },
+  "keywords": [
+    "cli",
+    "tree",
+    "context",
+    "llm",
+    "chatgpt",
+    "analyzer"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/QubeUtils/Golurk/issues"
+  },
+  "homepage": "https://github.com/QubeUtils/Golurk#readme"
+}
