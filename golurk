@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
-# Version: 1.0.0
+# Version: 1.0.1
 # Changes from v4.0.0:
 #   IMPLEMENTED (were stubs / broken):
 #   - --json / --yaml now fully serialize output (were hollow flags)

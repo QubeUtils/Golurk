@@ -1,6 +1,6 @@
 {
   "name": "golurk",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Full featured Project Structure Analyzer & LLM Context Builder",
   "main": "golurk",
   "bin": {
@@ -21,7 +21,7 @@
     "chatgpt",
     "analyzer"
   ],
-  "author": "Your Name",
+  "author": "Sasmitha K",
   "license": "MIT",
   "bugs": {
     "url": "https://github.com/QubeUtils/Golurk/issues"
