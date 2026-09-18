@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
-# Version: 1.0.2
+# Version: 1.0.3
 # Changes from v4.0.0:
 #   IMPLEMENTED (were stubs / broken):
 #   - --json / --yaml now fully serialize output (were hollow flags)
@@ -33,7 +33,7 @@ ORIGINAL_ARGS=("$@")
 PROJECT_ROOT="$(pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")" 2>/dev/null || SCRIPT_PATH="${BASH_SOURCE[0]}"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-VERSION="1.0.0"
+VERSION="1.0.3"
 
 # ── Output / selection ────────────────────────────────────────────────
 OUTPUT_FILE=""
