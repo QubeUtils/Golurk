@@ -24,6 +24,7 @@ brew install golurk
 ```bash
 npm install -g golurk
 ```
+*(Note: On Linux/WSL, you may need to use `sudo npm install -g golurk` if you encounter an `EACCES` permission error, or [configure npm for global installs](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally).)*
 
 Or run it without installing anything permanently:
 
