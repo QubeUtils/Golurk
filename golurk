@@ -1,26 +1,18 @@
 #!/usr/bin/env bash
 # golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
-# Version: 1.0.3
-# Changes from v4.0.0:
-#   IMPLEMENTED (were stubs / broken):
-#   - --json / --yaml now fully serialize output (were hollow flags)
-#   - stats --desktop now writes to a file (was always printing to stdout)
-#   - to_windows_path() wired via print_saved_path() on every "saved to" message
-#   - get_changed_files() uses git status -z (filenames with spaces now handled)
-#   - detect_desktop() uses while+read loop (WSL usernames with spaces now handled)
-#   - validate_size_arg() guards --max-size before it reaches find
-#   NEW FEATURES:
-#   - load_golurkrc(): .golurkrc project-level config file (safe eval, CLI overrides)
-#   - --gitignore-full: negation (!) + double-star (**) .gitignore support
-#   - Colorized output (auto-detected; --no-color to disable)
-#   - --follow-symlinks: passes -L to find, -l to tree
-#   - --dry-run: preview content dump file list without writing
-#   - --watch [--watch-interval N]: live-reload loop via re-exec
-#   - --template STRING: inject LLM header into content dumps ({DATE},{ROOT},{LANG},{VERSION})
-#   - --line-count: total source line count in stats
-#   - golurk diff [commit]: new command (--staged, --stat, --no-color)
-#   - stats -o FILE: save stats to an explicit file
-#   - escape_json_string(): safe path encoding for JSON/YAML output
+# Version: 1.0.4
+# Features:
+#   - High-performance context aggregation (AWK streaming & git fast-paths)
+#   - Project Tree Visualization (colorized, customizable depth/patterns)
+#   - JSON & YAML Structure Export
+#   - LLM-optimized Markdown Code Blocks & Token Estimation
+#   - Git Integration (diff analysis, --changed, ls-files fast-path)
+#   - Full .gitignore Support (including negation ! and double-star **)
+#   - Advanced Filtering (by extension, size limit, binary skipping)
+#   - Watch Mode (--watch) for live-reloading analysis
+#   - Project-level Config (.golurkrc)
+#   - Microservice Detection & Selection
+#   - Cross-Platform Compatibility (WSL & Windows Desktop mapping)
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -31,9 +23,9 @@ ORIGINAL_ARGS=("$@")
 # Basic env & defaults
 # ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT="$(pwd)"
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")" 2>/dev/null || SCRIPT_PATH="${BASH_SOURCE[0]}"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # ── Output / selection ────────────────────────────────────────────────
 OUTPUT_FILE=""
@@ -125,15 +117,22 @@ load_golurkrc() {
        && [[ "$stripped" != *'`'* ]]; then
       
       local key="${stripped%%=*}"
-      local value="${stripped#*=}"
+      local value
+      local is_append=false
+      
+      if [[ "$key" == *+ ]]; then
+         key="${key%+}"
+         value="${stripped#*+=}"
+         is_append=true
+      else
+         value="${stripped#*=}"
+      fi
       
       # Strip leading/trailing quotes
       value="${value%\"}"; value="${value#\"}"
       value="${value%\'}"; value="${value#\'}"
       
-      # Handle += operator
-      if [[ "${stripped%%=*}" == *+ ]]; then
-         key="${key%+}"
+      if [[ "$is_append" == true ]]; then
          declare -g "$key=${!key:-}$value"
       else
          declare -g "$key=$value"
@@ -153,6 +152,14 @@ detect_desktop() {
   if [[ -d "$HOME/desktop" ]]; then echo "$HOME/desktop" && return; fi
   # WSL: use while+read to correctly handle usernames that contain spaces
   if grep -qEi "(Microsoft|WSL)" /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    local win_user=""
+    if command -v cmd.exe &>/dev/null; then
+      win_user="$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')"
+    fi
+    if [[ -n "$win_user" && -d "/mnt/c/Users/$win_user/Desktop" ]]; then
+      echo "/mnt/c/Users/$win_user/Desktop"; return
+    fi
+    # fallback
     while IFS= read -r u; do
       [[ -z "$u" ]] && continue
       if [[ -d "/mnt/c/Users/$u/Desktop" ]]; then
@@ -324,6 +331,7 @@ copy_to_clipboard() {
   else
     cat > /dev/null
     echo "Warning: No clipboard utility found (clip.exe, pbcopy, xclip, xsel)" >&2
+    return 1
   fi
 }
 
@@ -336,15 +344,82 @@ escape_json_string() {
   local s="$1"
   s="${s//\\/\\\\}"   # backslashes first
   s="${s//\"/\\\"}"   # double quotes
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\b'/\\b}"
+  s="${s//$'\f'/\\f}"
   printf '%s' "$s"
+}
+
+# Used to find files for -C
+run_find_files_for_target() {
+  local target="$1"
+  
+  # Fast-path using git ls-files if inside a git repo
+  if command -v git &>/dev/null && git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+    if [[ ${#SIZE_EXPR[@]} -eq 0 && "$FOLLOW_SYMLINKS" = false && -z "$MAX_DEPTH" && -z "$FILE_NAME_PATTERN" && ${#EXTRA_EXCLUDES[@]} -eq 0 && -z "$DIR_PATTERN" ]]; then
+       git ls-files -z --cached --others --exclude-standard -- "$target" 2>/dev/null
+       return
+    fi
+  fi
+  
+  # Fast-path using fd/fdfind if available
+  if command -v fd &>/dev/null || command -v fdfind &>/dev/null; then
+    local fd_bin="fd"
+    command -v fdfind &>/dev/null && fd_bin="fdfind"
+    local -a fd_cmd=("$fd_bin" -t f -H) # -H to include hidden files
+    [[ "$FOLLOW_SYMLINKS" = true ]] && fd_cmd+=(-L)
+    [[ -n "$MAX_DEPTH" ]] && fd_cmd+=(-d "$MAX_DEPTH")
+    
+    # Add custom excludes
+    for ignore in "${DIR_IGNORES[@]}"; do
+       fd_cmd+=(-E "$ignore")
+    done
+    
+    if [[ ${#SIZE_EXPR[@]} -gt 0 ]]; then
+       # fallback to find if size filters are present to guarantee exact match
+       :
+    else
+      if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
+         fd_cmd+=("$FILE_NAME_PATTERN")
+      else
+         fd_cmd+=(".")
+      fi
+      
+      fd_cmd+=("$target" -0)
+      "${fd_cmd[@]}" 2>/dev/null
+      return
+    fi
+  fi
+
+  local -a find_cmd=(find)
+  [[ "$FOLLOW_SYMLINKS" = true ]] && find_cmd+=(-L)
+  find_cmd+=("$target")
+  [[ -n "$MAX_DEPTH" ]] && find_cmd+=(-maxdepth "$MAX_DEPTH")
+  [[ ${#PRUNE_ARGS[@]} -gt 0 ]] && find_cmd+=("${PRUNE_ARGS[@]}")
+  if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
+    find_cmd+=(-type f -name "$FILE_NAME_PATTERN")
+  else
+    find_cmd+=(-type f)
+  fi
+  [[ ${#SIZE_EXPR[@]} -gt 0 ]] && find_cmd+=("${SIZE_EXPR[@]}")
+  find_cmd+=(-print0)
+  "${find_cmd[@]}"
 }
 
 build_tree_pattern() {
   local -n _dirs=$1
   local -n _files=$2
   local pat=""
-  for d in "${_dirs[@]}"; do pat="${pat:+$pat|}$d"; done
-  for f in "${_files[@]}"; do pat="${pat:+$pat|}$f"; done
+  for d in "${_dirs[@]}"; do
+    local safe; safe=$(printf "%s" "$d" | escape_for_regex)
+    pat="${pat:+$pat|}$safe"
+  done
+  for f in "${_files[@]}"; do
+    local safe; safe=$(printf "%s" "$f" | escape_for_regex)
+    pat="${pat:+$pat|}$safe"
+  done
   echo "$pat"
 }
 
@@ -375,8 +450,10 @@ is_text_file() {
     [[ "$mime" == text/* ]] && return 0
     case "$mime" in
       application/json|application/xml|application/javascript|\
-      application/x-sh|application/x-shellscript|application/x-python) return 0 ;;
-      *) return 1 ;;
+      application/x-sh|application/x-shellscript|application/x-python|\
+      application/toml|application/yaml|application/x-yaml|application/typescript|\
+      application/graphql|application/sql) return 0 ;;
+      *) LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1 ;;
     esac
   else
     LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1
@@ -460,20 +537,33 @@ shorten_path() {
 # Returns 0 = pass through, 1 = filtered out
 filter_by_extension() {
   local file="$1" include="$2" exclude="$3"
-  local ext="${file##*.}"
+  local base="${file##*/}"
+  local ext="${base##*.}"
+  local has_ext=true
+  [[ "$ext" == "$base" ]] && has_ext=false
+
   if [[ -n "$include" ]]; then
-    [[ "$ext" == "$file" ]] && return 1
     IFS=',' read -ra exts <<< "$include"
     local found=false
     for e in "${exts[@]}"; do
-      e="${e// /}"; [[ "$ext" == "$e" ]] && found=true && break
+      e="${e// /}"
+      if [[ "$has_ext" == false ]]; then
+        [[ "$e" == "none" || "$e" == "$base" ]] && found=true && break
+      else
+        [[ "$ext" == "$e" ]] && found=true && break
+      fi
     done
     [[ "$found" = false ]] && return 1
   fi
-  if [[ -n "$exclude" && "$ext" != "$file" ]]; then
+  if [[ -n "$exclude" ]]; then
     IFS=',' read -ra exts <<< "$exclude"
     for e in "${exts[@]}"; do
-      e="${e// /}"; [[ "$ext" == "$e" ]] && return 1
+      e="${e// /}"
+      if [[ "$has_ext" == false ]]; then
+        [[ "$e" == "none" || "$e" == "$base" ]] && return 1
+      else
+        [[ "$ext" == "$e" ]] && return 1
+      fi
     done
   fi
   return 0
@@ -505,7 +595,12 @@ collect_stats() {
     for ignore in "${_dir_ignores[@]}"; do
       dir_cmd+=( -not -path "*/$ignore/*" -not -name "$ignore" )
     done
-    total_dirs=$((total_dirs + $("${dir_cmd[@]}" 2>/dev/null | wc -l)))
+    while IFS= read -r -d '' d; do
+      if [[ -n "$DIR_PATTERN" ]]; then
+        printf '%s' "$d" | grep -qE "(^|/)$DIR_PATTERN(/|$)" || continue
+      fi
+      total_dirs=$((total_dirs + 1))
+    done < <("${dir_cmd[@]}" -print0 2>/dev/null)
 
     local file_cmd=(find "$target" -type f)
     for ignore in "${_dir_ignores[@]}"; do
@@ -513,6 +608,9 @@ collect_stats() {
     done
 
     while IFS= read -r -d '' file; do
+      if [[ -n "$DIR_PATTERN" ]]; then
+        printf '%s' "$file" | grep -qE "(^|/)$DIR_PATTERN(/|$)" || continue
+      fi
       local skip=false
       for ignore in "${_file_ignores[@]}"; do
         [[ "$file" == *"$ignore"* ]] && skip=true && break
@@ -545,6 +643,18 @@ collect_stats() {
     size_human="${total_size} bytes"
   fi
 
+  local tokens_human=""
+  if [[ $total_size -ge 0 ]]; then
+    local tokens=$((total_size / 4))
+    if [[ $tokens -ge 1000000 ]]; then
+      tokens_human=$(awk "BEGIN { printf \"%.1fM\", $tokens / 1000000 }")
+    elif [[ $tokens -ge 1000 ]]; then
+      tokens_human=$(awk "BEGIN { printf \"%.1fk\", $tokens / 1000 }")
+    else
+      tokens_human="$tokens"
+    fi
+  fi
+
   local ext_stats=""
   if [[ -n "$by_extension" ]]; then
     ext_stats=$(echo "$by_extension" | tr ' ' '\n' | sort | uniq -c | sort -nr | head -5 \
@@ -554,6 +664,7 @@ collect_stats() {
   printf "${C_BOLD}Directories:${C_RESET}  %s\n"  "$total_dirs"
   printf "${C_BOLD}Files:        ${C_RESET} %s\n"  "$total_files"
   printf "${C_BOLD}Total Size:   ${C_RESET} %s\n"  "$size_human"
+  printf "${C_BOLD}Est. Tokens:  ${C_RESET} ~%s\n" "$tokens_human"
   [[ "$SHOW_LINE_COUNT" = true ]] && printf "${C_BOLD}Total Lines:  ${C_RESET} %s\n" "$total_lines"
   [[ -n "$ext_stats" ]]          && printf "${C_BOLD}Top Ext:      ${C_RESET} %s\n" "$ext_stats"
 }
@@ -706,11 +817,11 @@ read_gitignore() {
     if [[ "$line" == */ ]]; then
       local entry="${line%/}"; entry="${entry#./}"
       # Double-star normalization: **/<name>/ → <name>
-      entry="${entry##**/}"
+      entry="${entry#\*\*/}"
       DIR_IGNORES+=("$entry")
     else
       local entry2="${line#./}"
-      entry2="${entry2##**/}"   # **/*.ext → *.ext
+      entry2="${entry2#\*\*/}"   # **/*.ext → *.ext
       FILE_IGNORES+=("$entry2")
     fi
   done < "$gitignore"
@@ -884,6 +995,10 @@ load_golurkrc
 
 if [[ $# -eq 0 ]]; then banner; exit 0; fi
 
+for arg in "$@"; do
+  if [[ "$arg" == "--version" ]]; then version; exit 0; fi
+done
+
 COMMAND="$1"; shift
 
 case "$COMMAND" in
@@ -934,6 +1049,7 @@ case "$COMMAND" in
         --dry-run)           DRY_RUN=true; shift ;;
         --watch)             WATCH_MODE=true; shift ;;
         --watch-interval)    require_arg "$1" "${2:-}"; WATCH_INTERVAL="$2"; shift 2 ;;
+        --no-watch-reexec)   WATCH_MODE=false; shift ;;
         --template)          require_arg "$1" "${2:-}"; CONTENT_TEMPLATE="$2"; shift 2 ;;
         --gitignore-full)    GITIGNORE_FULL=true; shift ;;
         --clip)              USE_CLIPBOARD=true; shift ;;
@@ -974,6 +1090,7 @@ case "$COMMAND" in
     # Changed files
     if [[ "$ONLY_CHANGED" = true ]]; then
       if changed_files=$(get_changed_files); then
+        [[ -z "$changed_files" ]] && echo "No changed files found" >&2 && exit 0
         mapfile -t changed_arr <<< "$changed_files"
         [[ ${#changed_arr[@]} -eq 0 ]] && echo "No changed files found" >&2 && exit 0
         SELECT_PATHS=()
@@ -997,9 +1114,15 @@ case "$COMMAND" in
       OUTPUT_FILE="$DESKTOP_PATH/$(basename "$OUTPUT_FILE")"
       printf "Output will be saved to: %s\n" "$(print_saved_path "$OUTPUT_FILE")" >&2
     fi
-    if [[ "$DUMP_CONTENTS" = true && -n "$CONTENTS_FILE" && "$CONTENTS_TO_DESKTOP" = true ]]; then
-      CONTENTS_FILE="$DESKTOP_PATH/$(basename "$CONTENTS_FILE")"
-      printf "Contents will be saved to: %s\n" "$(print_saved_path "$CONTENTS_FILE")" >&2
+    if [[ "$DUMP_CONTENTS" = true ]]; then
+      if [[ -z "$CONTENTS_FILE" && "$CONTENTS_TO_DESKTOP" = true ]]; then
+        echo "Error: --contents-desktop requires -C <filename> to specify the file name." >&2
+        exit 1
+      fi
+      if [[ -n "$CONTENTS_FILE" && "$CONTENTS_TO_DESKTOP" = true ]]; then
+        CONTENTS_FILE="$DESKTOP_PATH/$(basename "$CONTENTS_FILE")"
+        printf "Contents will be saved to: %s\n" "$(print_saved_path "$CONTENTS_FILE")" >&2
+      fi
     fi
     if [[ "$OUTPUT_TO_DESKTOP" = true && -z "$OUTPUT_FILE" ]]; then
       OUTPUT_FILE="$DESKTOP_PATH/project-structure-$(date +%Y%m%d-%H%M%S).txt"
@@ -1025,7 +1148,7 @@ case "$COMMAND" in
       while true; do
         clear 2>/dev/null || true
         printf "${C_BOLD}[golurk watch]${C_RESET} ${C_DIM}$(date '+%H:%M:%S') · every ${WATCH_INTERVAL}s · Ctrl+C to stop${C_RESET}\n\n"
-        "$SCRIPT_PATH" "${REWATCH_ARGS[@]}" 2>&1 || true
+        "$SCRIPT_PATH" --no-watch-reexec "${REWATCH_ARGS[@]}" 2>&1 || true
         sleep "$WATCH_INTERVAL"
       done
     fi
@@ -1037,20 +1160,36 @@ case "$COMMAND" in
           | while IFS= read -r line; do process_find_output "$line" || true; done
       )
       if [[ "$USE_JSON" = true ]]; then
-        if [[ -z "$OUTPUT_FILE" ]]; then
+        if [[ "$USE_CLIPBOARD" = true ]]; then
+          output_json OUTPUT_LINES | copy_to_clipboard
+          printf "✅ JSON structure copied to clipboard\n"
+        elif [[ -z "$OUTPUT_FILE" ]]; then
           output_json OUTPUT_LINES
         else
           output_json OUTPUT_LINES > "$OUTPUT_FILE"
           printf "✅ JSON structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
         fi
       else
-        if [[ -z "$OUTPUT_FILE" ]]; then
+        if [[ "$USE_CLIPBOARD" = true ]]; then
+          output_yaml OUTPUT_LINES | copy_to_clipboard
+          printf "✅ YAML structure copied to clipboard\n"
+        elif [[ -z "$OUTPUT_FILE" ]]; then
           output_yaml OUTPUT_LINES
         else
           output_yaml OUTPUT_LINES > "$OUTPUT_FILE"
           printf "✅ YAML structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
         fi
       fi
+      
+      if [[ "$SHOW_STATS" = true ]]; then
+        TARGETS_TO_STATS=("${INITIAL_TARGETS[@]}")
+        if [[ -z "$OUTPUT_FILE" ]]; then
+          collect_stats TARGETS_TO_STATS DIR_IGNORES FILE_IGNORES >&2
+        else
+          collect_stats TARGETS_TO_STATS DIR_IGNORES FILE_IGNORES
+        fi
+      fi
+      
       exit 0
     fi
 
@@ -1111,9 +1250,10 @@ case "$COMMAND" in
       }
 
       # FIX: avoid double-prefix when CONTENTS_FILE is already an absolute path
-      if   [[ "$CONTENTS_FILE" == /* ]];          then CONTENTS_FILE_PATH="$CONTENTS_FILE"
-      elif [[ "$CONTENTS_TO_DESKTOP" = true ]];   then CONTENTS_FILE_PATH="$CONTENTS_FILE"
-      else CONTENTS_FILE_PATH="$PROJECT_ROOT/$CONTENTS_FILE"
+      if [[ "$CONTENTS_FILE" == /* || "$CONTENTS_FILE" == [a-zA-Z]:/* || "$CONTENTS_FILE" == [a-zA-Z]:\\* ]]; then
+        CONTENTS_FILE_PATH="$CONTENTS_FILE"
+      else
+        CONTENTS_FILE_PATH="$PROJECT_ROOT/$CONTENTS_FILE"
       fi
 
       # --dry-run: list files that would be included, then exit
@@ -1150,84 +1290,60 @@ case "$COMMAND" in
       TMP_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_tmp.XXXXXX")"
       trap 'rm -f "$TMP_LIST"' EXIT
 
-      run_find_files_for_target() {
-        local target="$1"
-        
-        # Fast-path using fd/fdfind if available
-        if command -v fd &>/dev/null || command -v fdfind &>/dev/null; then
-          local fd_bin="fd"
-          command -v fdfind &>/dev/null && fd_bin="fdfind"
-          local -a fd_cmd=("$fd_bin" -t f -H) # -H to include hidden files
-          [[ "$FOLLOW_SYMLINKS" = true ]] && fd_cmd+=(-L)
-          [[ -n "$MAX_DEPTH" ]] && fd_cmd+=(-d "$MAX_DEPTH")
-          
-          # Add custom excludes
-          for ignore in "${DIR_IGNORES[@]}"; do
-             fd_cmd+=(-E "$ignore")
-          done
-          
-          if [[ ${#SIZE_EXPR[@]} -gt 0 ]]; then
-             # fallback to find if size filters are present to guarantee exact match
-             :
-          else
-            if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
-               fd_cmd+=("$FILE_NAME_PATTERN")
-            else
-               fd_cmd+=(".")
-            fi
-            
-            fd_cmd+=("$target" -0)
-            "${fd_cmd[@]}" 2>/dev/null
-            return
-          fi
-        fi
 
-        local -a find_cmd=(find)
-        [[ "$FOLLOW_SYMLINKS" = true ]] && find_cmd+=(-L)
-        find_cmd+=("$target")
-        [[ -n "$MAX_DEPTH" ]] && find_cmd+=(-maxdepth "$MAX_DEPTH")
-        [[ ${#PRUNE_ARGS[@]} -gt 0 ]] && find_cmd+=("${PRUNE_ARGS[@]}")
-        if [[ "$SELECT_FILES_ONLY" = true && -n "$FILE_NAME_PATTERN" ]]; then
-          find_cmd+=(-type f -name "$FILE_NAME_PATTERN")
-        else
-          find_cmd+=(-type f)
-        fi
-        [[ ${#SIZE_EXPR[@]} -gt 0 ]] && find_cmd+=("${SIZE_EXPR[@]}")
-        find_cmd+=(-print0)
-        "${find_cmd[@]}"
-      }
 
       for t in "${INITIAL_TARGETS[@]}"; do
         run_find_files_for_target "$t" >> "$TMP_LIST" 2>/dev/null || true
       done
 
       if [[ -s "$TMP_LIST" ]]; then
+        local FINAL_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_final.XXXXXX")"
+        trap 'rm -f "$TMP_LIST" "$FINAL_LIST"' EXIT
+
         while IFS= read -r -d '' file; do
           [[ -f "$file" ]] || continue
+
+          if [[ -n "$DIR_PATTERN" ]]; then
+            if ! printf '%s' "$file" | grep -qE "(^|/)$DIR_PATTERN(/|$)"; then continue; fi
+          fi
 
           if [[ -n "$GREP_REGEX" ]]; then
             if printf '%s' "$file" | grep -E -q "$GREP_REGEX"; then continue; fi
           fi
 
-          # FIX: use shared filter_by_extension() — no more inline duplicate
           if [[ -n "$FILTER_EXTENSIONS" || -n "$EXCLUDE_EXTENSIONS" ]]; then
             filter_by_extension "$file" "$FILTER_EXTENSIONS" "$EXCLUDE_EXTENSIONS" || continue
           fi
 
           if [[ "$SKIP_BINARIES" = true ]]; then
             if ! is_text_file "$file"; then
-              printf "\n----- SKIPPED BINARY: %s -----\n" "$file" >> "$CONTENTS_FILE_PATH"
-              printf "[Skipped binary file: %s]\n"          "$file" >> "$CONTENTS_FILE_PATH"
+              printf "\nFile: \`%s\`\n" "$file" >> "$CONTENTS_FILE_PATH"
+              printf "```\n[Skipped binary file]\n```\n" >> "$CONTENTS_FILE_PATH"
               continue
             fi
           fi
 
-          header_path="$file"
-          [[ "$SHORTEN_PATHS" = true ]] && header_path=$(shorten_path "$file")
-          printf "\n----- FILE: %s -----\n" "$header_path" >> "$CONTENTS_FILE_PATH"
-          cat -- "$file" >> "$CONTENTS_FILE_PATH" 2>/dev/null \
-            || printf "\n[Could not read file: %s]\n" "$file" >> "$CONTENTS_FILE_PATH"
+          printf '%s\0' "$file" >> "$FINAL_LIST"
         done < "$TMP_LIST"
+
+        if [[ -s "$FINAL_LIST" ]]; then
+          xargs -0 awk '
+            FNR == 1 {
+              if (last != "") { printf "\n```\n" }
+              ext = FILENAME
+              if (match(ext, /\.[^.]+$/)) {
+                ext = substr(ext, RSTART+1, RLENGTH-1)
+              } else {
+                ext = ""
+              }
+              printf "\nFile: `%s`\n", FILENAME
+              printf "```%s\n", ext
+              last = FILENAME
+            }
+            { print }
+            END { if (last != "") printf "\n```\n" }
+          ' < "$FINAL_LIST" >> "$CONTENTS_FILE_PATH" 2>/dev/null
+        fi
       fi
 
       if [[ "$USE_CLIPBOARD" = true ]]; then
