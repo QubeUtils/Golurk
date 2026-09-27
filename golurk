@@ -190,6 +190,12 @@ detect_desktop() {
   if [[ -d "$HOME/desktop" ]]; then echo "$HOME/desktop" && return; fi
   # WSL: use while+read to correctly handle usernames that contain spaces
   if grep -qEi "(Microsoft|WSL)" /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    # Fast fallback using whoami directly
+    local wsl_user; wsl_user=$(whoami 2>/dev/null)
+    if [[ -n "$wsl_user" && -d "/mnt/c/Users/$wsl_user/Desktop" ]]; then
+      echo "/mnt/c/Users/$wsl_user/Desktop"; return
+    fi
+    
     local win_user=""
     if command -v cmd.exe &>/dev/null; then
       win_user="$(cmd.exe /c echo %USERNAME% 2>/dev/null | tr -d '\r')"
@@ -698,7 +704,7 @@ collect_stats() {
   printf "${C_BOLD}Directories:${C_RESET}  %s\n"  "$total_dirs"
   printf "${C_BOLD}Files:        ${C_RESET} %s\n"  "$total_files"
   printf "${C_BOLD}Total Size:   ${C_RESET} %s\n"  "$size_human"
-  printf "${C_BOLD}Est. Tokens:  ${C_RESET} ~%s\n" "$tokens_human"
+  printf "${C_BOLD}Est. Tokens:  ${C_RESET} ~%s (rough heuristic)\n" "$tokens_human"
   [[ "$SHOW_LINE_COUNT" = true ]] && printf "${C_BOLD}Total Lines:  ${C_RESET} %s\n" "$total_lines"
   [[ -n "$ext_stats" ]]          && printf "${C_BOLD}Top Ext:      ${C_RESET} %s\n" "$ext_stats"
 }
@@ -714,6 +720,7 @@ output_json() {
     function escape_str(s) {
       gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s)
       gsub(/\t/, "\\t", s); gsub(/\n/, "\\n", s); gsub(/\r/, "\\r", s)
+      gsub(/\f/, "\\f", s); gsub(/\b/, "\\b", s)
       return s
     }
     BEGIN {
@@ -767,7 +774,17 @@ list_or_select_microservices() {
     for item in ./*/; do
       if [[ -d "$item" ]]; then
         local dir_name="${item%/}"; dir_name="${dir_name#./}"
-        if [[ -f "$dir_name/pom.xml" ]] || [[ -d "$dir_name/src" ]]; then
+        local is_micro=0
+        if [[ ${#MICROSERVICE_MARKERS[@]} -gt 0 ]]; then
+          for marker in "${MICROSERVICE_MARKERS[@]}"; do
+            [[ -e "$dir_name/$marker" ]] && is_micro=1 && break
+          done
+        else
+          if [[ -f "$dir_name/pom.xml" || -f "$dir_name/package.json" || -f "$dir_name/go.mod" || -f "$dir_name/Cargo.toml" || -f "$dir_name/requirements.txt" || -f "$dir_name/build.gradle" || -d "$dir_name/src" ]]; then
+            is_micro=1
+          fi
+        fi
+        if [[ $is_micro -eq 1 ]]; then
           printf "${C_GREEN}%s${C_RESET}\n" "$dir_name"
           found=1
         fi
@@ -1174,7 +1191,14 @@ case "$COMMAND" in
         clear 2>/dev/null || true
         printf "${C_BOLD}[golurk watch]${C_RESET} ${C_DIM}$(date '+%H:%M:%S') · every ${WATCH_INTERVAL}s · Ctrl+C to stop${C_RESET}\n\n"
         "$SCRIPT_PATH" --no-watch-reexec "${REWATCH_ARGS[@]}" 2>&1 || true
-        sleep "$WATCH_INTERVAL"
+        
+        if command -v inotifywait >/dev/null 2>&1; then
+          inotifywait -r -e modify,create,delete,move -q "$PROJECT_ROOT" >/dev/null 2>&1 || sleep "$WATCH_INTERVAL"
+        elif command -v fswatch >/dev/null 2>&1; then
+          fswatch -1 "$PROJECT_ROOT" >/dev/null 2>&1 || sleep "$WATCH_INTERVAL"
+        else
+          sleep "$WATCH_INTERVAL"
+        fi
       done
     fi
 
