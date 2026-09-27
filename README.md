@@ -82,6 +82,7 @@ golurk tree
 ```bash
 golurk tree -C context.txt --skip-binaries -M 500k
 ```
+> *Uses high-performance AWK streaming and Git fast-paths, formatting output natively into Markdown code blocks.*
 
 **Add a custom header to the LLM context dump:**
 ```bash
@@ -136,7 +137,7 @@ Generates a visual project tree and optionally aggregates file contents into a s
 | Option | Description |
 |---|---|
 | `-o, --output FILE` | Save tree output to a file |
-| `-C, --contents-file FILE` | Aggregate all file contents into a single file |
+| `-C, --contents-file FILE` | Aggregate all file contents into a single file (Markdown code block format) |
 | `-B, --skip-binaries` | Skip binary files during content aggregation |
 | `-M, --max-size SIZE` | Skip files larger than a given size (e.g. `5M`, `500k`) |
 | `-m, --microservices LIST` | Target only specific microservices by name |
@@ -170,7 +171,7 @@ golurk micro --microservices
 
 ### `golurk stats [options]`
 
-Shows a summary of directories, files, total size, and top file extensions.
+Shows a summary of directories, files, total size, top file extensions, and an LLM Token Estimate.
 
 | Option | Description |
 |---|---|

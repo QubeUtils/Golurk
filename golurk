@@ -233,7 +233,7 @@ Options:
   -o, --output FILE            Save tree output to FILE
   -e, --exclude PATTERN        Extra exclude pattern (repeatable)
   -p, --path PATH              Specific directory or file to show (repeatable)
-  -C, --contents-file FILE     Aggregate contents of files into FILE
+  -C, --contents-file FILE     Aggregate contents of files into FILE (Markdown format)
   -B, --skip-binaries          Skip binary files when aggregating contents
   -M, --max-size SIZE          Skip files larger than SIZE (e.g., 5M, 500k)
   -f, --file-name PATTERN      Only show files matching PATTERN (e.g., "pom.xml")
@@ -255,7 +255,7 @@ Options:
   --show-levels                Show level numbers in output
   --json                       Output JSON format
   --yaml                       Output YAML format
-  --stats                      Show statistics summary
+  --stats                      Show statistics summary (includes LLM Token Estimation)
   --line-count                 Include total line count in --stats output
   --changed                    Only show directories/files with git changes
   --follow-symlinks            Follow symbolic links during traversal
