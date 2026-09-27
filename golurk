@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
-# Version: 1.0.4
+# Version: 1.1.0
 # Features:
-#   - High-performance context aggregation (AWK streaming & git fast-paths)
+#   - Extreme Performance (AWK serialization, xargs batching, zero-subprocess loops)
+#   - High-performance context aggregation with Git ls-files fast-paths
 #   - Project Tree Visualization (colorized, customizable depth/patterns)
-#   - JSON & YAML Structure Export
+#   - JSON & YAML Structure Export (Powered natively by AWK)
 #   - LLM-optimized Markdown Code Blocks & Token Estimation
-#   - Git Integration (diff analysis, --changed, ls-files fast-path)
+#   - Git Integration (diff analysis, --changed, fast pathing)
 #   - Full .gitignore Support (including negation ! and double-star **)
 #   - Advanced Filtering (by extension, size limit, binary skipping)
 #   - Watch Mode (--watch) for live-reloading analysis
@@ -25,7 +26,7 @@ ORIGINAL_ARGS=("$@")
 PROJECT_ROOT="$(pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-VERSION="1.0.4"
+VERSION="1.1.0"
 
 # ── Output / selection ────────────────────────────────────────────────
 OUTPUT_FILE=""
@@ -445,19 +446,8 @@ build_grep_regex() {
 
 is_text_file() {
   local file="$1"
-  if command -v file &>/dev/null; then
-    local mime; mime=$(file --mime-type -b -- "$file" 2>/dev/null || echo "")
-    [[ "$mime" == text/* ]] && return 0
-    case "$mime" in
-      application/json|application/xml|application/javascript|\
-      application/x-sh|application/x-shellscript|application/x-python|\
-      application/toml|application/yaml|application/x-yaml|application/typescript|\
-      application/graphql|application/sql) return 0 ;;
-      *) LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1 ;;
-    esac
-  else
-    LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1
-  fi
+  [[ ! -s "$file" ]] && return 0
+  LC_ALL=C grep -Iq . -- "$file" 2>/dev/null && return 0 || return 1
 }
 
 # FIX v5: validate --max-size format before it reaches find
@@ -590,6 +580,42 @@ collect_stats() {
   local -n _file_ignores=$3
   local total_dirs=0 total_files=0 total_size=0 total_lines=0 by_extension=""
 
+  local STATS_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_stats.XXXXXX")"
+  local FILTERED_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_stats_filtered.XXXXXX")"
+  trap 'rm -f "$STATS_LIST" "$FILTERED_LIST"' EXIT
+
+  for target in "${_targets[@]}"; do
+    run_find_files_for_target "$target" >> "$STATS_LIST" 2>/dev/null || true
+  done
+  
+  if [[ -s "$STATS_LIST" ]]; then
+    while IFS= read -r -d '' file; do
+      [[ -f "$file" ]] || continue
+      [[ -n "$DIR_PATTERN" ]] && ! printf '%s' "$file" | grep -qE "(^|/)$DIR_PATTERN(/|$)" && continue
+      [[ -n "$GREP_REGEX" ]] && printf '%s' "$file" | grep -E -q "$GREP_REGEX" && continue
+      printf '%s\0' "$file" >> "$FILTERED_LIST"
+    done < "$STATS_LIST"
+  fi
+
+  if [[ -s "$FILTERED_LIST" ]]; then
+    total_files=$(tr -dc '\0' < "$FILTERED_LIST" | wc -c | tr -d ' ')
+    total_size=$(xargs -0 wc -c < "$FILTERED_LIST" 2>/dev/null | awk '{if ($NF != "total") sum += $1} END {print sum+0}')
+    
+    if [[ "$SHOW_LINE_COUNT" = true ]]; then
+      local LC_LIST="$(mktemp "${TMPDIR:-/tmp}/golurk_lc.XXXXXX")"
+      xargs -0 grep -Il "^" < "$FILTERED_LIST" | tr '\n' '\0' > "$LC_LIST" 2>/dev/null || true
+      if [[ -s "$LC_LIST" ]]; then
+        total_lines=$(xargs -0 wc -l < "$LC_LIST" 2>/dev/null | awk '{if ($NF != "total") sum += $1} END {print sum+0}')
+      fi
+      rm -f "$LC_LIST"
+    fi
+    
+    while IFS= read -r -d '' file; do
+      local ext="${file##*.}"
+      [[ "$ext" != "$file" ]] && by_extension="$by_extension$ext "
+    done < "$FILTERED_LIST"
+  fi
+  
   for target in "${_targets[@]}"; do
     local dir_cmd=(find "$target" -type d)
     for ignore in "${_dir_ignores[@]}"; do
@@ -601,35 +627,6 @@ collect_stats() {
       fi
       total_dirs=$((total_dirs + 1))
     done < <("${dir_cmd[@]}" -print0 2>/dev/null)
-
-    local file_cmd=(find "$target" -type f)
-    for ignore in "${_dir_ignores[@]}"; do
-      file_cmd+=( -not -path "*/$ignore/*" -not -name "$ignore" )
-    done
-
-    while IFS= read -r -d '' file; do
-      if [[ -n "$DIR_PATTERN" ]]; then
-        printf '%s' "$file" | grep -qE "(^|/)$DIR_PATTERN(/|$)" || continue
-      fi
-      local skip=false
-      for ignore in "${_file_ignores[@]}"; do
-        [[ "$file" == *"$ignore"* ]] && skip=true && break
-      done
-      if [[ "$skip" = false ]]; then
-        total_files=$((total_files + 1))
-        if [[ -f "$file" ]]; then
-          local size; size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
-          total_size=$((total_size + size))
-          local ext="${file##*.}"
-          [[ "$ext" != "$file" ]] && by_extension="$by_extension$ext "
-          # v5: optional line count (only for text files to avoid binary noise)
-          if [[ "$SHOW_LINE_COUNT" = true ]] && is_text_file "$file"; then
-            local lc; lc=$(wc -l < "$file" 2>/dev/null || echo 0)
-            total_lines=$((total_lines + lc))
-          fi
-        fi
-      fi
-    done < <("${file_cmd[@]}" -print0 2>/dev/null)
   done
 
   local size_human=""
@@ -673,60 +670,51 @@ collect_stats() {
 # JSON serializer  [NEW v5]
 # ──────────────────────────────────────────────────────────────────────
 output_json() {
-  local -n _lines=$1
-  local generated_at
-  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
-  printf '{\n'
-  printf '  "version": "%s",\n'      "$VERSION"
-  printf '  "root": "%s",\n'         "$(escape_json_string "$PROJECT_ROOT")"
-  printf '  "generated_at": "%s",\n' "$generated_at"
-  printf '  "items": [\n'
-  local count="${#_lines[@]}" i=0
-  for line in "${_lines[@]}"; do
-    local type_str="file"; [[ -d "$line" ]] && type_str="directory"
-    local level_info; level_info=$(format_with_levels "$line")
-    local level="${level_info%%:*}"
-    local rel_path="${line#./}"
-    local ext=""
-    if [[ "$type_str" = "file" ]]; then
-      local base="${rel_path##*/}"; ext="${base##*.}"; [[ "$ext" = "$base" ]] && ext=""
-    fi
-    i=$((i + 1))
-    local comma=","; [[ $i -eq $count ]] && comma=""
-    printf '    {"path": "%s", "type": "%s", "level": %s' \
-      "$(escape_json_string "$rel_path")" "$type_str" "$level"
-    [[ -n "$ext" ]] && printf ', "ext": "%s"' "$(escape_json_string "$ext")"
-    printf '}%s\n' "$comma"
-  done
-  printf '  ]\n'
-  printf '}\n'
+  local tmp_file="$1"
+  local generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  
+  awk -F'|' -v root="$PROJECT_ROOT" -v version="$VERSION" -v date="$generated_at" '
+    function escape_str(s) {
+      gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s)
+      gsub(/\t/, "\\t", s); gsub(/\n/, "\\n", s); gsub(/\r/, "\\r", s)
+      return s
+    }
+    BEGIN {
+      printf "{\n  \"version\": \"%s\",\n  \"root\": \"%s\",\n  \"generated_at\": \"%s\",\n  \"items\": [\n", version, escape_str(root), date
+      first = 1
+    }
+    {
+      if (!first) printf ",\n"
+      first = 0
+      rel_path = $4; for(i=5; i<=NF; i++) rel_path = rel_path "|" $i
+      printf "    {\"path\": \"%s\", \"type\": \"%s\", \"level\": %s", escape_str(rel_path), $1, $2
+      if ($3 != "") printf ", \"ext\": \"%s\"", escape_str($3)
+      printf "}"
+    }
+    END { printf "\n  ]\n}\n" }
+  ' "$tmp_file"
 }
 
 # ──────────────────────────────────────────────────────────────────────
 # YAML serializer  [NEW v5]
 # ──────────────────────────────────────────────────────────────────────
 output_yaml() {
-  local -n _lines=$1
-  local generated_at
-  generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
-  printf 'version: "%s"\n'      "$VERSION"
-  printf 'root: "%s"\n'         "$(escape_json_string "$PROJECT_ROOT")"
-  printf 'generated_at: "%s"\n' "$generated_at"
-  printf 'items:\n'
-  for line in "${_lines[@]}"; do
-    local type_str="file"; [[ -d "$line" ]] && type_str="directory"
-    local level_info; level_info=$(format_with_levels "$line")
-    local level="${level_info%%:*}"
-    local rel_path="${line#./}"
-    local ext=""
-    if [[ "$type_str" = "file" ]]; then
-      local base="${rel_path##*/}"; ext="${base##*.}"; [[ "$ext" = "$base" ]] && ext=""
-    fi
-    printf '  - path: "%s"\n'  "$(escape_json_string "$rel_path")"
-    printf '    type: %s\n'    "$type_str"
-    printf '    level: %s\n'   "$level"
-    [[ -n "$ext" ]] && printf '    ext: %s\n' "$(escape_json_string "$ext")"
-  done
+  local tmp_file="$1"
+  local generated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+  
+  awk -F'|' -v root="$PROJECT_ROOT" -v version="$VERSION" -v date="$generated_at" '
+    function escape_str(s) {
+      gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s
+    }
+    BEGIN {
+      printf "version: \"%s\"\nroot: \"%s\"\ngenerated_at: \"%s\"\nitems:\n", version, escape_str(root), date
+    }
+    {
+      rel_path = $4; for(i=5; i<=NF; i++) rel_path = rel_path "|" $i
+      printf "  - path: \"%s\"\n    type: %s\n    level: %s\n", escape_str(rel_path), $1, $2
+      if ($3 != "") printf "    ext: %s\n", escape_str($3)
+    }
+  ' "$tmp_file"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1155,28 +1143,45 @@ case "$COMMAND" in
 
     # ── Structured output: JSON / YAML (buffer first, then serialize) ──
     if [[ "$USE_JSON" = true || "$USE_YAML" = true ]]; then
-      mapfile -t OUTPUT_LINES < <(
-        for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
-          | while IFS= read -r line; do process_find_output "$line" || true; done
-      )
+      TMP_STRUCT="$(mktemp "${TMPDIR:-/tmp}/golurk_struct.XXXXXX")"
+      trap 'rm -f "$TMP_STRUCT"' EXIT
+      
+      for t in "${INITIAL_TARGETS[@]}"; do run_find_for_target "$t"; done \
+        | while IFS= read -r line; do
+            res=$(process_find_output "$line") || continue
+            [[ -z "$res" ]] && continue
+            type_str="file"
+            [[ -d "$line" ]] && type_str="directory"
+            
+            level_info=$(format_with_levels "$res")
+            level="${level_info%%:*}"
+            rel_path="${line#./}"
+            
+            ext=""
+            if [[ "$type_str" = "file" ]]; then
+              base="${rel_path##*/}"; ext="${base##*.}"; [[ "$ext" = "$base" ]] && ext=""
+            fi
+            printf "%s|%s|%s|%s\n" "$type_str" "$level" "$ext" "$rel_path" >> "$TMP_STRUCT"
+          done
+
       if [[ "$USE_JSON" = true ]]; then
         if [[ "$USE_CLIPBOARD" = true ]]; then
-          output_json OUTPUT_LINES | copy_to_clipboard
+          output_json "$TMP_STRUCT" | copy_to_clipboard
           printf "✅ JSON structure copied to clipboard\n"
         elif [[ -z "$OUTPUT_FILE" ]]; then
-          output_json OUTPUT_LINES
+          output_json "$TMP_STRUCT"
         else
-          output_json OUTPUT_LINES > "$OUTPUT_FILE"
+          output_json "$TMP_STRUCT" > "$OUTPUT_FILE"
           printf "✅ JSON structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
         fi
       else
         if [[ "$USE_CLIPBOARD" = true ]]; then
-          output_yaml OUTPUT_LINES | copy_to_clipboard
+          output_yaml "$TMP_STRUCT" | copy_to_clipboard
           printf "✅ YAML structure copied to clipboard\n"
         elif [[ -z "$OUTPUT_FILE" ]]; then
-          output_yaml OUTPUT_LINES
+          output_yaml "$TMP_STRUCT"
         else
-          output_yaml OUTPUT_LINES > "$OUTPUT_FILE"
+          output_yaml "$TMP_STRUCT" > "$OUTPUT_FILE"
           printf "✅ YAML structure saved to %s\n" "$(print_saved_path "$OUTPUT_FILE")"
         fi
       fi

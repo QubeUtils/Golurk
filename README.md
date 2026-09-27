@@ -4,7 +4,7 @@
 
 > Project Structure Analyser — visualise trees, aggregate code, and scope to microservices.
 
-`golurk` is a zero-dependency bash tool for modern development workflows. It goes beyond the classic `tree` command by letting you dump file contents for LLM context, target specific microservices in a monorepo, output JSON or YAML, watch for live changes, and save files directly to your desktop. It works natively on Linux, macOS, and WSL on Windows.
+`golurk` is a highly-optimized, zero-dependency bash tool for modern development workflows. Leveraging pure AWK serialization, `xargs` batching, and `git ls-files` fast-paths, it executes at near-C speeds. It goes beyond the classic `tree` command by letting you dump file contents into Markdown for LLMs, target specific microservices in a monorepo, output JSON or YAML, watch for live changes, and save files directly to your desktop. It works natively on Linux, macOS, and WSL on Windows.
 
 Brought to you by [QubeUtils](https://github.com/QubeUtils).
 
