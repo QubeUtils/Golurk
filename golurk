@@ -101,6 +101,43 @@ setup_colors() {
 setup_colors
 
 # ──────────────────────────────────────────────────────────────────────
+# Update Checker (Non-blocking)
+# ──────────────────────────────────────────────────────────────────────
+check_for_updates() {
+  local cache_file="${HOME}/.golurk_latest_version"
+  
+  # 1. Print banner if we already know an update exists
+  if [[ -f "$cache_file" ]]; then
+    local latest; latest=$(cat "$cache_file" 2>/dev/null || true)
+    if [[ -n "$latest" && "$latest" != "$VERSION" ]]; then
+      printf "\n${C_YELLOW}⭐ A new version of golurk is available! (${C_BOLD}%s${C_RESET}${C_YELLOW}) - Run 'npm i -g golurk@latest' or 'brew upgrade golurk' to update.${C_RESET}\n\n" "$latest" >&2
+    elif [[ "$latest" == "$VERSION" ]]; then
+      rm -f "$cache_file" 2>/dev/null || true
+    fi
+  fi
+
+  # 2. Check for new updates in the background (only once a day to prevent spam)
+  local last_check_file="${HOME}/.golurk_last_check"
+  local current_time; current_time=$(date +%s 2>/dev/null || echo 0)
+  local last_check; last_check=$(cat "$last_check_file" 2>/dev/null || echo 0)
+  
+  if (( current_time - last_check > 86400 )); then
+    echo "$current_time" > "$last_check_file" 2>/dev/null || true
+    (
+      local latest_npm; latest_npm=$(curl -s --max-time 3 https://registry.npmjs.org/golurk/latest 2>/dev/null | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+      if [[ -n "$latest_npm" && "$latest_npm" != "$VERSION" ]]; then
+        echo "$latest_npm" > "$cache_file" 2>/dev/null || true
+      fi
+    ) &>/dev/null &
+  fi
+}
+
+# Run the update check (except in watch mode or pure JSON/YAML output modes)
+if [[ "${ORIGINAL_ARGS[*]:-}" != *"--json"* && "${ORIGINAL_ARGS[*]:-}" != *"--yaml"* && "${ORIGINAL_ARGS[*]:-}" != *"--watch"* && "${ORIGINAL_ARGS[*]:-}" != *"--version"* ]]; then
+  check_for_updates
+fi
+
+# ──────────────────────────────────────────────────────────────────────
 # .golurkrc — project-level config loader
 # Loaded at startup; CLI args applied afterwards and always win.
 # Only safe VAR=value / VAR+=value assignments are allowed.
