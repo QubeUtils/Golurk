@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # golurk - Full featured Project Structure Analyzer (WSL/Windows friendly)
-# Version: 1.1.0
+# Version: 1.1.1
 # Features:
 #   - Extreme Performance (AWK serialization, xargs batching, zero-subprocess loops)
 #   - High-performance context aggregation with Git ls-files fast-paths
@@ -26,7 +26,7 @@ ORIGINAL_ARGS=("$@")
 PROJECT_ROOT="$(pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ── Output / selection ────────────────────────────────────────────────
 OUTPUT_FILE=""
@@ -1038,14 +1038,14 @@ load_golurkrc
 if [[ $# -eq 0 ]]; then banner; exit 0; fi
 
 for arg in "$@"; do
-  if [[ "$arg" == "--version" ]]; then version; exit 0; fi
+  if [[ "$arg" == "--version" || "$arg" == "-v" ]]; then version; exit 0; fi
 done
 
 COMMAND="$1"; shift
 
 case "$COMMAND" in
-  -h|--help)  banner;  exit 0 ;;
-  --version)  version; exit 0 ;;
+  -h|--help)    banner;  exit 0 ;;
+  -v|--version) version; exit 0 ;;
 
   # ────────────────────────────────────────────────────────────────────
   tree)
